@@ -11,6 +11,7 @@ uv venv --python 3.12
 source .venv/bin/activate
 
 # https://github.com/vllm-project/vllm/pull/39291/changes
+uv pip install omegaconf datasets uvicorn fastapi ipython "pydantic>=2.0" pytest python-dotenv pandas requests
 uv pip install torch==2.11.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 uv pip install "deep-gemm @ git+https://github.com/deepseek-ai/DeepGemm.git" --no-build-isolation
 uv pip install sentencepiece protobuf datasets==4.3.0 huggingface-hub==1.9.2 hf_transfer "safetensors>=0.4.3"
