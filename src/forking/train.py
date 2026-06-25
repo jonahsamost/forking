@@ -32,6 +32,8 @@ def run():
     tokenizer.pad_token = tokenizer.eos_token
     dataset = load_dataset(DATASET, split="train")
     training_args = GRPOConfig(
+        use_vllm=True,
+        vllm_mode="server",
     )
     trainer = GRPOTrainer(
         model=MODEL_NAME,
