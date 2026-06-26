@@ -4,7 +4,7 @@
 POD_IP="$1"
 POD_PORT="$2"
 LOCAL_DIR=/Users/jonah/gpu/forking
-REMOTE_DIR="root@${POD_IP}:/root/forking"
+REMOTE_DIR="root@${POD_IP}:/root/"
 KEY_PATH="~/.ssh/id_ed25519"
 # ---------------------
 

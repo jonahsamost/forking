@@ -1,15 +1,25 @@
+import os
 import sys
 from omegaconf import DictConfig, OmegaConf
 import logging
 import time
 import requests
+from transformers import AutoTokenizer
 
 logger = logging.getLogger(__name__)
 
 
+def sync_chat_template(model_name: str, trl_template_path: str):
+    logger.info(f"Trl path: {trl_template_path}")
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    assert os.path.exists(trl_template_path), f"Trl template path is wrong: {trl_template_path}"
+    with open(trl_template_path, "w") as f:
+        f.write(tokenizer.chat_template)
+
+
 def load_cfg(conf_path) -> DictConfig:
     base = OmegaConf.load(conf_path)
-    args = sys.argv[1]
+    args = sys.argv[1:]
     yaml_args = [a for a in args if a.endswith((".yaml"))]
     dot_overrides = [a for a in args if "=" in a and not a.endswith((".yaml"))]
     cfg = OmegaConf.merge(base, OmegaConf.load(yaml_args[0])) if yaml_args else base    

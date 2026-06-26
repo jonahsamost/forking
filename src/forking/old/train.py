@@ -8,9 +8,14 @@ import sys
 import warnings
 from pathlib import Path
 from dotenv import load_dotenv
+
+from trl.trl.experimental.async_grpo import AsyncGRPOConfig, AsyncGRPOTrainer
+from trl.trl.rewards import accuracy_reward
+
 from trl.trl.rewards.accuracy_rewards import accuracy_reward
 from trl.trl.trainer.grpo_trainer import GRPOTrainer
 from trl.trl.trainer.grpo_config import GRPOConfig
+
 load_dotenv()
 
 from omegaconf import DictConfig, OmegaConf
@@ -21,7 +26,7 @@ from datasets import load_dataset
 from forking.utils import load_cfg, wait_for_vllm_servers
 
 logger = logging.getLogger(__name__)
-_CONF_PATH = Path(__file__).resolve().parent / "train.conf"
+_CONF_PATH = Path(__file__).resolve().parent / "train.yaml"
 
 
 def run():
@@ -42,7 +47,7 @@ def run():
     tokenizer.padding_side = "left"
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    dataset = load_dataset(cfg.model.dataset, split=cfg.dataset.split)
+    dataset = load_dataset(cfg.dataset.name, split=cfg.dataset.split)
     if cfg.dataset.get("max_samples") > 0:
         dataset = dataset.select(range(int(cfg.dataset.max_samples)))
     logger.info(f"Dataset size: {len(dataset)}")

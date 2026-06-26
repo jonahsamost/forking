@@ -1,26 +1,26 @@
 model:
   name: "Qwen/Qwen3-4B-Instruct-2507"
-  attn_implementation: "flash_attention_2"
+  attn_implementation: "sdpa"
   dtype: "bfloat16"
 
 dataset:
   name: "trl-lib/DeepMath-103K"
   split: "train"
-  max_samples: 256   # null = full
+  max_samples: 2048   # null = full
 
 vllm:
   server_url: "http://127.0.0.1"
   server_port: 8800
   server_timeout: 600.0
-  max_model_length: 2048
+  max_model_length: 4096
 
 training:
   output_dir: "outputs/grpo_simple"
   max_steps: 50
-  per_device_train_batch_size: 1
-  gradient_accumulation_steps: 4
+  per_device_train_batch_size: 2
+  gradient_accumulation_steps: 16
   num_generations: 8
-  max_completion_length: 512
+  max_completion_length: 1024
   learning_rate: 1e-5
   logging_steps: 1
   save_steps: 25
