@@ -16,7 +16,7 @@ vllm:
 
 training:
   output_dir: "outputs/grpo_simple"
-  max_steps: 50
+  max_steps: 500
   per_device_train_batch_size: 2
   gradient_accumulation_steps: 16
   num_generations: 8
@@ -27,3 +27,6 @@ training:
   temperature: 1.0
   report_to: "wandb"
   seed: 42
+  threshold_burst: 1.36
+  threshold_rebound: 1.33
+  threshold_chunk_size: 64
