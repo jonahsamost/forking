@@ -44,6 +44,7 @@ def run():
         per_device_train_batch_size=t.per_device_train_batch_size,
         gradient_accumulation_steps=t.gradient_accumulation_steps,
         num_generations=t.num_generations,
+        max_inflight_tasks=t.max_inflight_tasks,
         max_completion_length=t.max_completion_length,
         learning_rate=t.learning_rate,
         logging_steps=t.logging_steps,
@@ -57,6 +58,9 @@ def run():
         vllm_server_timeout=cfg.vllm.server_timeout,
         log_completions=False,
         chat_template_kwargs={"enable_thinking": False},
+
+        warmup_ratio=t.warmup_ratio,
+        lr_scheduler_type=t.lr_scheduler_type,
     )
 
     trainer = AsyncGRPOTrainer(

@@ -6,7 +6,7 @@ model:
 dataset:
   name: "trl-lib/DeepMath-103K"
   split: "train"
-  max_samples: 2048   # null = full
+  max_samples: 0
 
 vllm:
   server_url: "http://127.0.0.1"
@@ -18,15 +18,18 @@ training:
   output_dir: "outputs/grpo_simple"
   max_steps: 500
   per_device_train_batch_size: 2
-  gradient_accumulation_steps: 16
+  gradient_accumulation_steps: 64
   num_generations: 8
+  max_inflight_tasks: 128
   max_completion_length: 1024
-  learning_rate: 1e-5
+  learning_rate: 5e-6
   logging_steps: 1
   save_steps: 25
   temperature: 1.0
   report_to: "wandb"
   seed: 42
+  lr_scheduler_type: "cosine"
+  warmup_ratio: 0.05
   threshold_burst: 1.36
   threshold_rebound: 1.33
   threshold_chunk_size: 64
