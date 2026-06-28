@@ -30,6 +30,11 @@ training:
   seed: 42
   lr_scheduler_type: "cosine"
   warmup_ratio: 0.05
-  threshold_burst: 1.36
-  threshold_rebound: 1.33
+
+entropy:
   threshold_chunk_size: 64
+  topk_entropy: 3
+  max_interventions: 3
+  num_splits: 3
+  calibration_batches: 1 
+  calibration_ema: 0.9

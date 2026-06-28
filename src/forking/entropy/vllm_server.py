@@ -54,9 +54,10 @@ async def run_server(args: Namespace, **uvicorn_kwargs) -> None:
 
     entropy_handler = EntropyHandler(
         engine,
-        chunk_size=cfg.training.threshold_chunk_size,
-        threshold_burst=cfg.training.threshold_burst,
-        threshold_rebound=cfg.training.threshold_rebound,
+        chunk_size=cfg.entropy.threshold_chunk_size,
+        topk_entropy=cfg.entropy.topk_entropy,
+        max_interventions=cfg.entropy.max_interventions,
+        num_samples=cfg.entropy.num_samples,
     )
 
     @app.post("/v1/completions")
