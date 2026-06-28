@@ -35,6 +35,6 @@ entropy:
   threshold_chunk_size: 64
   topk_entropy: 3
   max_interventions: 3
-  num_splits: 3
+  num_samples: 3
   calibration_batches: 1 
   calibration_ema: 0.9

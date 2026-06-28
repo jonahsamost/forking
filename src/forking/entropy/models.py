@@ -1,10 +1,20 @@
 from dataclasses import dataclass, asdict
+from typing import Any
 
 @dataclass
 class EntropyXargs:
-    entropy: int  # whether to do entroy book-keeping
-    intervene: int  # whether server intervenes
-    max_interventions: int
+    entropy: int = 0  # whether to do entropy bookkeeping
+    intervene: int = 0  # whether server intervenes
+    tau_vix: float | None = None
+    tau_drift: float | None = None
+    tau_drawup: float | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "EntropyXargs":
+        if not data:
+            return cls()
+        fields = cls.__dataclass_fields__
+        return cls(**{key: value for key, value in data.items() if key in fields})
 
 
 @dataclass

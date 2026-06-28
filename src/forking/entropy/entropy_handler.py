@@ -1,19 +1,15 @@
-from importlib.metadata import entry_points
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.entrypoints.openai.completion.protocol import (
     CompletionRequest,
     CompletionLogProbs,
     CompletionResponse,
     CompletionResponseChoice,
-    ErrorResponse,
 )
-from vllm.logprobs import LogprobsOnePosition
 from vllm.entrypoints.openai.engine.protocol import (
     UsageInfo,
 )
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.renderers.inputs.preprocess import (
-    extract_prompt_components,
     extract_prompt_len,
 )
 from vllm.inputs import tokens_input
@@ -31,7 +27,6 @@ MASK_64_BITS = (1 << 64) - 1
 
 def _random_uuid() -> str:
     return f"{uuid.uuid4().int & MASK_64_BITS:016x}"  # 16 hex chars
-
 
 
 class EntropyHandler:
@@ -60,7 +55,7 @@ class EntropyHandler:
 
     def _calculate_entropy_trajectory(
         self, output: CompletionOutput, 
-    ) -> tuple[list[float], list[float]]:
+    ) -> list[float]:
         entropies: list[float] = []
 
         for pos_logprobs in output.logprobs or []:
@@ -219,7 +214,8 @@ class EntropyHandler:
         request_id = _random_uuid()
         created_time = int(time.time())
         max_model_len = self.engine.model_config.max_model_len
-        engine_input = tokens_input(prompt_token_ids=request.prompt)
+        prompt_ids = list(request.prompt)
+        engine_input = tokens_input(prompt_token_ids=prompt_ids)
 
         max_tokens = get_max_tokens(
             max_model_len,
@@ -230,7 +226,7 @@ class EntropyHandler:
             truncate_prompt_tokens=request.truncate_prompt_tokens,
         )
         outputs = await self._generate(
-            list(request.prompt),
+            prompt_ids,
             max_tokens,
             request.temperature or 1.0,
             request_id,
@@ -267,9 +263,9 @@ class EntropyHandler:
             )         
             ],
             usage=UsageInfo(
-                prompt_tokens=len(engine_input),
+                prompt_tokens=len(prompt_ids),
                 completion_tokens=len(output.token_ids),
-                total_tokens=len(engine_input) + len(output.token_ids),
+                total_tokens=len(prompt_ids) + len(output.token_ids),
             ),
             entropy={
                 "vix": sampled_vix,
@@ -285,7 +281,7 @@ class EntropyHandler:
 
         prompt_ids = list(request.prompt)
         engine_input = tokens_input(prompt_token_ids=prompt_ids)
-        xargs = EntropyXargs(**request.vllm_xargs)
+        xargs = EntropyXargs.from_dict(request.vllm_xargs)
 
         max_tokens = get_max_tokens(
             max_model_len,
@@ -469,7 +465,7 @@ class EntropyHandler:
     async def handler(
         self, request: CompletionRequest, raw_request: Request
     ) -> CompletionResponse:
-        xargs = EntropyXargs(**request.vllm_xargs)
+        xargs = EntropyXargs.from_dict(request.vllm_xargs)
         if xargs.intervene:
             return await self.intervention_handler(request, raw_request)
         else:

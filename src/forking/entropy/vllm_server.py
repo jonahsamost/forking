@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import signal
 from pathlib import Path
-import asyncio
 import uvloop
 from argparse import Namespace
 
@@ -19,7 +18,7 @@ from vllm.entrypoints.launcher import serve_http
 from vllm.entrypoints.openai.completion.protocol import CompletionRequest
 from fastapi import Request
 
-from forking.entropy.entropy_handler import EntropyHandler, handler
+from forking.entropy.entropy_handler import EntropyHandler
 from forking.utils import load_cfg
 
 logger = logging.getLogger(__name__)
@@ -63,7 +62,7 @@ async def run_server(args: Namespace, **uvicorn_kwargs) -> None:
     @app.post("/v1/completions")
     async def _entropy_completions(request: CompletionRequest, raw_request: Request):
         logger.info("Hit entropy completions!")
-        return await entropy_handler.handler(request, raw_request, engine)
+        return await entropy_handler.handler(request, raw_request)
 
     await init_app_state(engine, app.state, args, supported_tasks)
 
