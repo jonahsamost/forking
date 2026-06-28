@@ -36,5 +36,6 @@ entropy:
   topk_entropy: 3
   max_interventions: 3
   num_samples: 3
+  update_interval: 32
   calibration_batches: 1 
   calibration_ema: 0.9

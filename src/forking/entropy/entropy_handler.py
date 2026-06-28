@@ -21,7 +21,16 @@ import time
 import math
 import uuid
 
-from forking.entropy.models import EntropyXargs, VixValues
+from forking.entropy.models import (
+    INTERVENED_KEY,
+    INTERVENTIONS_USED_KEY,
+    SPLIT_INDICES_KEY,
+    TOKEN_ENTROPY_KEY,
+    TOKEN_IDX_KEY,
+    VIX_METADATA_KEY,
+    EntropyXargs,
+    VixValues,
+)
 
 MASK_64_BITS = (1 << 64) - 1
 
@@ -144,18 +153,25 @@ class EntropyHandler:
             raise RuntimeError("vLLM generation returned no output")
         return final_result.outputs
 
-    def _sampled_token_logprobs(self, output: CompletionOutput) -> list[float | None]:
-        if not output.logprobs:
-            return [None] * len(output.token_ids)
-        return [
-            pos[token_id].logprob if pos and token_id in pos else None
-            for token_id, pos in zip(output.token_ids, output.logprobs)
-        ]
+    def _sampled_token_logprobs(self, output: CompletionOutput) -> list[float]:
+        assert output.logprobs is not None, "vLLM did not return token logprobs"
+        assert len(output.token_ids) == len(output.logprobs), (
+            "Misaligned token IDs and logprobs: "
+            f"token_ids={len(output.token_ids)}, logprobs={len(output.logprobs)}"
+        )
+        token_logprobs: list[float] = []
+        for token_idx, (token_id, pos) in enumerate(zip(output.token_ids, output.logprobs, strict=True)):
+            assert pos is not None and token_id in pos, (
+                "Sampled token missing from vLLM logprobs: "
+                f"token_idx={token_idx}, token_id={token_id}"
+            )
+            token_logprobs.append(pos[token_id].logprob)
+        return token_logprobs
 
     def _assert_aligned(
         self,
         token_ids: list[int],
-        token_logprobs: list[float | None],
+        token_logprobs: list[float],
         entropies: list[float],
     ) -> None:
         assert len(token_ids) == len(token_logprobs) == len(entropies), (
@@ -169,19 +185,20 @@ class EntropyHandler:
         tau_vix = getattr(xargs, "tau_vix", None)
         tau_drift = getattr(xargs, "tau_drift", None)
         tau_drawup = getattr(xargs, "tau_drawup", None)
-        if tau_vix is None:
-            return 0.0
-        vix_excess = max(0.0, v.vix - tau_vix)
-        if vix_excess <= 0.0:
-            return 0.0
-        direction_excess = 0.0
-        if tau_drift is not None:
-            direction_excess = max(direction_excess, v.drift - tau_drift)
+        score = 0.0
+        if tau_vix is not None:
+            vix_excess = max(0.0, v.vix - tau_vix)
+            if vix_excess > 0.0:
+                direction_excess = 0.0
+                if tau_drift is not None:
+                    direction_excess = max(direction_excess, v.drift - tau_drift)
+                if tau_drawup is not None:
+                    direction_excess = max(direction_excess, v.drawup - tau_drawup)
+                if direction_excess > 0.0:
+                    score = max(score, vix_excess + direction_excess)
         if tau_drawup is not None:
-            direction_excess = max(direction_excess, v.drawup - tau_drawup)
-        if direction_excess <= 0.0:
-            return 0.0
-        return vix_excess + direction_excess
+            score = max(score, v.drawup - tau_drawup)
+        return max(0.0, score)
 
     def _find_split_idx(
         self,
@@ -237,8 +254,8 @@ class EntropyHandler:
         vix_values = self._rolling_vix(entropies)
         sampled_vix = [
             {
-                "token_idx": i,
-                "entropy": entropies[i],
+                TOKEN_IDX_KEY: i,
+                TOKEN_ENTROPY_KEY: entropies[i],
                 **vix_values[i].to_dict(),
             }
             for i in range(self.chunk_size - 1, len(vix_values), self.chunk_size)
@@ -268,7 +285,7 @@ class EntropyHandler:
                 total_tokens=len(prompt_ids) + len(output.token_ids),
             ),
             entropy={
-                "vix": sampled_vix,
+                VIX_METADATA_KEY: sampled_vix,
             }
         )
     
@@ -294,7 +311,7 @@ class EntropyHandler:
         temperature = request.temperature or 1.0
 
         all_token_ids: list[int] = []
-        all_token_logprobs: list[float | None] = []
+        all_token_logprobs: list[float] = []
         all_entropies: list[float] = []
         interventions_used = 0
         split_indices: list[int] = []
@@ -425,8 +442,8 @@ class EntropyHandler:
         final_vix = self._rolling_vix(all_entropies)
         sampled_vix = [
             {
-                "token_idx": i,
-                "entropy": all_entropies[i],
+                TOKEN_IDX_KEY: i,
+                TOKEN_ENTROPY_KEY: all_entropies[i],
                 **final_vix[i].to_dict(),
             }
             for i in range(self.chunk_size - 1, len(final_vix), self.chunk_size)
@@ -455,10 +472,10 @@ class EntropyHandler:
                 total_tokens=len(prompt_ids) + len(all_token_ids),
             ),
             entropy={
-                "intervened": interventions_used > 0,
-                "interventions_used": interventions_used,
-                "split_indices": split_indices,
-                "vix": sampled_vix,
+                INTERVENED_KEY: interventions_used > 0,
+                INTERVENTIONS_USED_KEY: interventions_used,
+                SPLIT_INDICES_KEY: split_indices,
+                VIX_METADATA_KEY: sampled_vix,
             },
         )
 

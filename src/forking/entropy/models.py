@@ -1,9 +1,8 @@
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, fields
 from typing import Any
 
 @dataclass
 class EntropyXargs:
-    entropy: int = 0  # whether to do entropy bookkeeping
     intervene: int = 0  # whether server intervenes
     tau_vix: float | None = None
     tau_drift: float | None = None
@@ -15,6 +14,20 @@ class EntropyXargs:
             return cls()
         fields = cls.__dataclass_fields__
         return cls(**{key: value for key, value in data.items() if key in fields})
+
+
+ENTROPY_RESPONSE_KEY = "entropy"
+VLLM_XARGS_KEY = "vllm_xargs"
+REQUESTED_INTERVENE_KEY = "requested_intervene"
+INTERVENED_KEY = "intervened"
+INTERVENTIONS_USED_KEY = "interventions_used"
+SPLIT_INDICES_KEY = "split_indices"
+VIX_METADATA_KEY = "vix"
+TOKEN_IDX_KEY = "token_idx"
+TOKEN_ENTROPY_KEY = "entropy"
+ENTROPY_XARGS_INTERVENE_KEY = next(
+    field.name for field in fields(EntropyXargs) if field.name == "intervene"
+)
 
 
 @dataclass
@@ -30,9 +43,6 @@ class VixValues:
         return asdict(self)
 
 
-@dataclass
-class EntropyResponse:
-    ...
-
-    def to_dict(self):
-        ...
+VIX_VALUE_KEY = next(field.name for field in fields(VixValues) if field.name == "vix")
+DRIFT_VALUE_KEY = next(field.name for field in fields(VixValues) if field.name == "drift")
+DRAWUP_VALUE_KEY = next(field.name for field in fields(VixValues) if field.name == "drawup")

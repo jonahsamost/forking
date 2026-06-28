@@ -37,6 +37,7 @@ def run():
         Path(__file__).resolve().parent / "../../trl/trl/chat_templates/qwen3.jinja",
     )
 
+    from forking.entropy.entropy_updates import EntropyUpdateTracker
     from trl.experimental.async_grpo import AsyncGRPOConfig, AsyncGRPOTrainer
     config = AsyncGRPOConfig(
         output_dir=t.output_dir,
@@ -62,12 +63,19 @@ def run():
         warmup_ratio=t.warmup_ratio,
         lr_scheduler_type=t.lr_scheduler_type,
     )
+    single_dev_bs = t.gradient_accumulation_steps * t.per_device_train_batch_size
+    entropy_tracker = EntropyUpdateTracker(
+        bootstrap_records=single_dev_bs,
+        update_interval=cfg.entropy.update_interval,
+        calibration_ema=cfg.entropy.calibration_ema,
+    )
 
     trainer = AsyncGRPOTrainer(
         model=cfg.model.name,
         args=config,
         train_dataset=dataset,
         reward_funcs=accuracy_reward,
+        entropy_tracker=entropy_tracker,
     )
 
     trainer.train()
