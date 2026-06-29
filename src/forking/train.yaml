@@ -13,6 +13,7 @@ vllm:
   server_port: 8800
   server_timeout: 600.0
   max_model_length: 4096
+  completions_endpoint: "/v1/entropy/completions"
 
 training:
   output_dir: "outputs/grpo_simple"
@@ -20,7 +21,7 @@ training:
   per_device_train_batch_size: 2
   gradient_accumulation_steps: 64
   num_generations: 8
-  max_inflight_tasks: 128
+  max_inflight_tasks: 100
   max_completion_length: 1024
   learning_rate: 5e-6
   logging_steps: 1
@@ -36,6 +37,7 @@ entropy:
   topk_entropy: 3
   max_interventions: 3
   num_samples: 3
-  update_interval: 32
+  update_interval: 64
   calibration_batches: 1 
-  calibration_ema: 0.9
+  calibration_ema: 0.95
+  max_success_trigger_rate: 0.1

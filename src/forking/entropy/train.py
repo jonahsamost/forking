@@ -56,6 +56,7 @@ def run():
         seed=t.seed,
         bf16=cfg.model.dtype == "bfloat16",
         vllm_server_base_url=vllm_url,
+        vllm_completions_endpoint=cfg.vllm.get("completions_endpoint", "/v1/completions"),
         vllm_server_timeout=cfg.vllm.server_timeout,
         log_completions=False,
         chat_template_kwargs={"enable_thinking": False},
@@ -68,6 +69,7 @@ def run():
         bootstrap_records=single_dev_bs,
         update_interval=cfg.entropy.update_interval,
         calibration_ema=cfg.entropy.calibration_ema,
+        max_success_trigger_rate=cfg.entropy.max_success_trigger_rate,
     )
 
     trainer = AsyncGRPOTrainer(

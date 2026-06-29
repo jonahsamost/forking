@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import signal
+import sys
 from pathlib import Path
 import uvloop
 from argparse import Namespace
@@ -21,9 +22,7 @@ from fastapi import Request
 from forking.entropy.entropy_handler import EntropyHandler
 from forking.utils import load_cfg
 
-logger = logging.getLogger(__name__)
 _CONF_PATH = Path(__file__).resolve().parent.parent / "train.yaml"
-
 
 async def run_server(args: Namespace, **uvicorn_kwargs) -> None:
     cfg = load_cfg(_CONF_PATH)
@@ -59,9 +58,14 @@ async def run_server(args: Namespace, **uvicorn_kwargs) -> None:
         num_samples=cfg.entropy.num_samples,
     )
 
-    @app.post("/v1/completions")
+    completions_endpoint = cfg.vllm.get("completions_endpoint", "/v1/completions")
+    completions_endpoint = (
+        completions_endpoint if completions_endpoint.startswith("/") else f"/{completions_endpoint}"
+    )
+    print("Registering entropy completions endpoint at %s", completions_endpoint)
+
+    @app.post(completions_endpoint)
     async def _entropy_completions(request: CompletionRequest, raw_request: Request):
-        logger.info("Hit entropy completions!")
         return await entropy_handler.handler(request, raw_request)
 
     await init_app_state(engine, app.state, args, supported_tasks)

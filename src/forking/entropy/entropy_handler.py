@@ -13,7 +13,7 @@ from vllm.renderers.inputs.preprocess import (
     extract_prompt_len,
 )
 from vllm.inputs import tokens_input
-from vllm.entrypoints.serve.utils.api_utils import get_max_tokens
+from vllm.entrypoints.utils import get_max_tokens
 from vllm.outputs import CompletionOutput
 
 from fastapi import Request
@@ -23,6 +23,8 @@ import uuid
 
 from forking.entropy.models import (
     INTERVENED_KEY,
+    INTERVENTION_IMPROVEMENT_RATE_KEY,
+    INTERVENTIONS_IMPROVED_KEY,
     INTERVENTIONS_USED_KEY,
     SPLIT_INDICES_KEY,
     TOKEN_ENTROPY_KEY,
@@ -224,6 +226,13 @@ class EntropyHandler:
             + sum(max(v.drift, 0.0) for v in branch_vix_values) / len(branch_vix_values)
             + max(v.drawup for v in branch_vix_values)
         )
+
+    @staticmethod
+    def _is_terminal_finish_reason(finish_reason: str | None) -> bool:
+        # Internal lookahead/branch calls use bounded token budgets, so "length"
+        # only means the local chunk budget was consumed. True stops should still
+        # terminate the full completion.
+        return finish_reason is not None and finish_reason != "length"
     
     async def non_intervention_handler(
         self, request: CompletionRequest, raw_request: Request
@@ -240,7 +249,6 @@ class EntropyHandler:
             extract_prompt_len(self.model_config, engine_input),
             self.default_sampling_params,
             self.override_max_tokens,
-            truncate_prompt_tokens=request.truncate_prompt_tokens,
         )
         outputs = await self._generate(
             prompt_ids,
@@ -306,7 +314,6 @@ class EntropyHandler:
             extract_prompt_len(self.model_config, engine_input),
             self.default_sampling_params,
             self.override_max_tokens,
-            truncate_prompt_tokens=request.truncate_prompt_tokens,
         )
         temperature = request.temperature or 1.0
 
@@ -314,6 +321,7 @@ class EntropyHandler:
         all_token_logprobs: list[float] = []
         all_entropies: list[float] = []
         interventions_used = 0
+        interventions_improved = 0
         split_indices: list[int] = []
         finish_reason = "length"
 
@@ -356,21 +364,22 @@ class EntropyHandler:
                 f"chunk_entropies={len(chunk_entropies)}"
             )
 
-            split_idx = self._find_split_idx(
+            detected_idx = self._find_split_idx(
                 chunk_vix,
                 xargs=xargs,
             )
 
-            if split_idx is None:
+            if detected_idx is None:
                 all_token_ids.extend(chunk_ids)
                 all_token_logprobs.extend(chunk_logprobs)
                 all_entropies.extend(chunk_entropies)
                 self._assert_aligned(all_token_ids, all_token_logprobs, all_entropies)
-                if output.finish_reason is not None:
+                if self._is_terminal_finish_reason(output.finish_reason):
                     finish_reason = output.finish_reason
                     break
                 continue
 
+            split_idx = max(0, detected_idx - self.chunk_size + 1)
             split_indices.append(len(all_token_ids) + split_idx)
             keep_ids = chunk_ids[:split_idx]
             keep_logprobs = chunk_logprobs[:split_idx]
@@ -378,6 +387,7 @@ class EntropyHandler:
             self._assert_aligned(keep_ids, keep_logprobs, keep_entropies)
             branch_prompt_ids = prompt_ids + all_token_ids + keep_ids
             branch_max_tokens = max(1, len(chunk_ids) - split_idx)
+            original_tail_score = self._branch_score(chunk_vix[split_idx:])
     
             best_branch = None
             best_branch_logprobs = None
@@ -422,7 +432,7 @@ class EntropyHandler:
                 all_token_logprobs.extend(chunk_logprobs)
                 all_entropies.extend(chunk_entropies)
                 self._assert_aligned(all_token_ids, all_token_logprobs, all_entropies)
-                if output.finish_reason is not None:
+                if self._is_terminal_finish_reason(output.finish_reason):
                     finish_reason = output.finish_reason
                     break
                 continue
@@ -435,7 +445,9 @@ class EntropyHandler:
             all_entropies.extend(best_branch_entropies)
             self._assert_aligned(all_token_ids, all_token_logprobs, all_entropies)
             interventions_used += 1
-            if best_branch.finish_reason is not None:
+            if best_branch_score < original_tail_score:
+                interventions_improved += 1
+            if self._is_terminal_finish_reason(best_branch.finish_reason):
                 finish_reason = best_branch.finish_reason
                 break
 
@@ -474,6 +486,12 @@ class EntropyHandler:
             entropy={
                 INTERVENED_KEY: interventions_used > 0,
                 INTERVENTIONS_USED_KEY: interventions_used,
+                INTERVENTIONS_IMPROVED_KEY: interventions_improved,
+                INTERVENTION_IMPROVEMENT_RATE_KEY: (
+                    interventions_improved / interventions_used
+                    if interventions_used
+                    else 0.0
+                ),
                 SPLIT_INDICES_KEY: split_indices,
                 VIX_METADATA_KEY: sampled_vix,
             },

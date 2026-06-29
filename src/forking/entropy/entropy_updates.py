@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import sys
 from collections import deque
 from dataclasses import dataclass
 from statistics import mean
@@ -10,6 +11,8 @@ from forking.entropy.models import (
     DRAWUP_VALUE_KEY,
     DRIFT_VALUE_KEY,
     ENTROPY_XARGS_INTERVENE_KEY,
+    INTERVENTION_IMPROVEMENT_RATE_KEY,
+    INTERVENTIONS_IMPROVED_KEY,
     INTERVENTIONS_USED_KEY,
     REQUESTED_INTERVENE_KEY,
     SPLIT_INDICES_KEY,
@@ -19,7 +22,19 @@ from forking.entropy.models import (
 )
 
 
-logger = logging.getLogger(__name__)
+def _module_logger(name: str) -> logging.Logger:
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.INFO)
+    if not logger.handlers:
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setLevel(logging.INFO)
+        handler.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
+        logger.addHandler(handler)
+    logger.propagate = False
+    return logger
+
+
+logger = _module_logger(__name__)
 
 
 def _safe_mean(values: Iterable[float]) -> float:
@@ -81,6 +96,7 @@ class VixThresholdCalibrator:
         calibration_ema: float,
         min_successes: int = 8,
         min_failures: int = 8,
+        max_success_trigger_rate: float = 0.05,
     ):
         self.success_records: deque[VixCalibrationRecord] = deque(maxlen=max_records)
         self.failure_records: deque[VixCalibrationRecord] = deque(maxlen=max_records)
@@ -89,6 +105,7 @@ class VixThresholdCalibrator:
         self.calibration_ema = calibration_ema
         self.min_successes = min_successes
         self.min_failures = min_failures
+        self.max_success_trigger_rate = max_success_trigger_rate
         self.thresholds: VixThresholds | None = None
         self.new_records_since_update = 0
         self.update_count = 0
@@ -148,7 +165,8 @@ class VixThresholdCalibrator:
         if fitted is None:
             self.last_fit_method = "skipped"
             return self.thresholds
-        if self.thresholds is None:
+        used_ema = self.thresholds is not None and self._any_buffer_full
+        if self.thresholds is None or not self._any_buffer_full:
             self.thresholds = fitted
         else:
             ema = self.calibration_ema
@@ -160,11 +178,33 @@ class VixThresholdCalibrator:
         self.new_records_since_update = 0
         self.update_count += 1
         self._update_trigger_metrics(self.thresholds)
+        logger.info(
+            "VIX thresholds updated: update_count=%s fit_method=%s "
+            "tau_vix=%.4f tau_drift=%.4f tau_drawup=%.4f "
+            "trigger_rate_success=%.4f trigger_rate_failure=%.4f youden_j=%.4f "
+            "max_success_trigger_rate=%.4f used_ema=%s success_records=%s failure_records=%s",
+            self.update_count,
+            self.last_fit_method,
+            self.thresholds.tau_vix,
+            self.thresholds.tau_drift,
+            self.thresholds.tau_drawup,
+            self.last_trigger_rate_success,
+            self.last_trigger_rate_failure,
+            self.last_youden_j,
+            self.max_success_trigger_rate,
+            used_ema,
+            len(self.success_records),
+            len(self.failure_records),
+        )
         return self.thresholds
 
     @property
     def _num_records(self) -> int:
         return len(self.success_records) + len(self.failure_records)
+
+    @property
+    def _any_buffer_full(self) -> bool:
+        return len(self.success_records) == self.success_records.maxlen or len(self.failure_records) == self.failure_records.maxlen
 
     def _records(self) -> list[VixCalibrationRecord]:
         return [*self.success_records, *self.failure_records]
@@ -192,31 +232,86 @@ class VixThresholdCalibrator:
         successes: list[VixCalibrationRecord],
         failures: list[VixCalibrationRecord],
     ) -> VixThresholds:
-        quantiles = [0.50, 0.60, 0.70, 0.80, 0.90, 0.95]
+        quantiles = [0.50, 0.60, 0.70, 0.80, 0.90, 0.925, 0.95, 0.975, 0.99]
         vix_candidates = sorted({ _quantile([r.vix_max for r in records], q) for q in quantiles })
         drift_candidates = sorted({ _quantile([r.drift_max for r in records], q) for q in quantiles })
         drawup_candidates = sorted({ _quantile([r.drawup_max for r in records], q) for q in quantiles })
 
-        best = VixThresholds(vix_candidates[0], drift_candidates[0], drawup_candidates[0])
-        best_score = float("-inf")
+        best: tuple[VixThresholds, float, float] | None = None
+        best_failure_rate = float("-inf")
+        fallback: tuple[VixThresholds, float, float] | None = None
+        fallback_key: tuple[float, float] | None = None
         best_success_rate = 0.0
-        best_failure_rate = 0.0
+        candidates: list[tuple[VixThresholds, float, float]] = []
         for tau_vix in vix_candidates:
             for tau_drift in drift_candidates:
                 for tau_drawup in drawup_candidates:
                     thresholds = VixThresholds(tau_vix, tau_drift, tau_drawup)
                     success_rate = self._trigger_rate(successes, thresholds)
                     failure_rate = self._trigger_rate(failures, thresholds)
-                    score = failure_rate - success_rate
-                    if score > best_score:
-                        best_score = score
-                        best = thresholds
-                        best_success_rate = success_rate
+                    candidates.append((thresholds, success_rate, failure_rate))
+
+                    fallback_candidate_key = (-success_rate, failure_rate)
+                    if fallback_key is None or fallback_candidate_key > fallback_key:
+                        fallback_key = fallback_candidate_key
+                        fallback = (thresholds, success_rate, failure_rate)
+
+                    if success_rate > self.max_success_trigger_rate:
+                        continue
+
+                    if best is None or (failure_rate, -success_rate) > (
+                        best_failure_rate,
+                        -best_success_rate,
+                    ):
                         best_failure_rate = failure_rate
-        self.last_youden_j = best_score
+                        best_success_rate = success_rate
+                        best = (thresholds, success_rate, failure_rate)
+
+        if best is None:
+            assert fallback is not None, "Expected at least one VIX threshold candidate"
+            selected, best_success_rate, best_failure_rate = fallback
+        else:
+            selected, best_success_rate, best_failure_rate = best
+
+        self.last_youden_j = best_failure_rate - best_success_rate
         self.last_trigger_rate_success = best_success_rate
         self.last_trigger_rate_failure = best_failure_rate
-        return best
+        self._log_separation_frontier(candidates)
+        return selected
+
+    def _log_separation_frontier(
+        self,
+        candidates: list[tuple[VixThresholds, float, float]],
+    ) -> None:
+        caps = [0.0, 0.01, 0.025, 0.05, .075, 0.10, 0.15]
+        parts = []
+        for cap in caps:
+            feasible = [
+                (thresholds, success_rate, failure_rate)
+                for thresholds, success_rate, failure_rate in candidates
+                if success_rate <= cap
+            ]
+            if not feasible:
+                parts.append(f"cap<={cap:.3f}:none")
+                continue
+            thresholds, success_rate, failure_rate = max(
+                feasible,
+                key=lambda candidate: (candidate[2], -candidate[1]),
+            )
+            parts.append(
+                "cap<=%.3f success=%.4f failure=%.4f youden=%.4f "
+                "tau=(%.4f,%.4f,%.4f)"
+                % (
+                    cap,
+                    success_rate,
+                    failure_rate,
+                    failure_rate - success_rate,
+                    thresholds.tau_vix,
+                    thresholds.tau_drift,
+                    thresholds.tau_drawup,
+                )
+            )
+        logger.info("VIX separation frontier: %s", " | ".join(parts))
 
     def _update_trigger_metrics(self, thresholds: VixThresholds) -> None:
         successes = list(self.success_records)
@@ -257,6 +352,7 @@ class VixThresholdCalibrator:
             "entropy/calibration_fit_separation": float(self.last_fit_method == "separation"),
             "entropy/calibration_fit_success_quantile": float(self.last_fit_method == "success_quantile"),
             "entropy/calibration_fit_skipped": float(self.last_fit_method == "skipped"),
+            "entropy/calibration_max_success_trigger_rate": self.max_success_trigger_rate,
             "entropy/control_success_vix_max_mean": _safe_mean(r.vix_max for r in successes),
             "entropy/control_failure_vix_max_mean": _safe_mean(r.vix_max for r in failures),
             "entropy/control_success_drawup_max_mean": _safe_mean(r.drawup_max for r in successes),
@@ -289,14 +385,16 @@ class EntropyUpdateTracker:
         self,
         bootstrap_records: int,
         max_records: int | None = None,
-        update_interval: int = 32,
+        update_interval: int = 64,
         calibration_ema: float = 0.9,
+        max_success_trigger_rate: float = 0.05,
     ):
         self.calibrator = VixThresholdCalibrator(
             max_records=max_records or max(bootstrap_records * 8, 1024),
             bootstrap_records=bootstrap_records,
             update_interval=update_interval,
             calibration_ema=calibration_ema,
+            max_success_trigger_rate=max_success_trigger_rate,
         )
 
     def request_xargs(self, sample_idx: int) -> dict[str, Any]:
@@ -313,6 +411,8 @@ class EntropyUpdateTracker:
         return {
             REQUESTED_INTERVENE_KEY: False,
             INTERVENTIONS_USED_KEY: 0,
+            INTERVENTIONS_IMPROVED_KEY: 0,
+            INTERVENTION_IMPROVEMENT_RATE_KEY: 0.0,
             SPLIT_INDICES_KEY: [],
             VIX_METADATA_KEY: [],
         }
@@ -330,6 +430,14 @@ class EntropyUpdateTracker:
         aggregate[INTERVENTIONS_USED_KEY] = int(aggregate.get(INTERVENTIONS_USED_KEY, 0)) + int(
             turn_entropy.get(INTERVENTIONS_USED_KEY, 0) or 0
         )
+        aggregate[INTERVENTIONS_IMPROVED_KEY] = int(aggregate.get(INTERVENTIONS_IMPROVED_KEY, 0)) + int(
+            turn_entropy.get(INTERVENTIONS_IMPROVED_KEY, 0) or 0
+        )
+        aggregate[INTERVENTION_IMPROVEMENT_RATE_KEY] = (
+            aggregate[INTERVENTIONS_IMPROVED_KEY] / aggregate[INTERVENTIONS_USED_KEY]
+            if aggregate[INTERVENTIONS_USED_KEY]
+            else 0.0
+        )
         aggregate.setdefault(SPLIT_INDICES_KEY, []).extend(
             token_offset + int(idx) for idx in (turn_entropy.get(SPLIT_INDICES_KEY) or [])
         )
@@ -338,6 +446,54 @@ class EntropyUpdateTracker:
             shifted = dict(window)
             shifted[TOKEN_IDX_KEY] = token_offset + int(shifted.get(TOKEN_IDX_KEY, 0))
             aggregate[VIX_METADATA_KEY].append(shifted)
+
+    def log_generation_metadata(
+        self,
+        *,
+        sample_idx: int,
+        turn_entropy: dict[str, Any],
+        requested_intervene: bool,
+        token_offset: int,
+        turn_len: int,
+    ) -> None:
+        windows = turn_entropy.get(VIX_METADATA_KEY) or []
+        vix_mean = _safe_mean(float(w.get(VIX_VALUE_KEY, 0.0)) for w in windows)
+        drawup_mean = _safe_mean(float(w.get(DRAWUP_VALUE_KEY, 0.0)) for w in windows)
+        drift_mean = _safe_mean(float(w.get(DRIFT_VALUE_KEY, 0.0)) for w in windows)
+        interventions_used = int(turn_entropy.get(INTERVENTIONS_USED_KEY, 0) or 0)
+        split_indices = turn_entropy.get(SPLIT_INDICES_KEY) or []
+
+        if requested_intervene:
+            # logger.info(
+            #     "Intervention entropy generation: sample_idx=%s "
+            #     "server_intervened=%s interventions_used=%s split_indices=%s "
+            #     "turn_len=%s token_offset=%s vix_windows=%s "
+            #     "vix_mean=%.4f drawup_mean=%.4f drift_mean=%.4f",
+            #     sample_idx,
+            #     interventions_used > 0,
+            #     interventions_used,
+            #     split_indices,
+            #     turn_len,
+            #     token_offset,
+            #     len(windows),
+            #     vix_mean,
+            #     drawup_mean,
+            #     drift_mean,
+            # )
+            return
+
+        # logger.info(
+        #     "Non-Intervention entropy generation: sample_idx=%s "
+        #     "turn_len=%s token_offset=%s vix_windows=%s "
+        #     "vix_mean=%.4f drawup_mean=%.4f drift_mean=%.4f",
+        #     sample_idx,
+        #     turn_len,
+        #     token_offset,
+        #     len(windows),
+        #     vix_mean,
+        #     drawup_mean,
+        #     drift_mean,
+        # )
 
     def update_from_scored_group(
         self,
@@ -386,6 +542,9 @@ class EntropyUpdateTracker:
     ) -> dict[str, float]:
         requested = [bool(m.get(REQUESTED_INTERVENE_KEY, False)) for m in entropy_metadata]
         interventions = [float(m.get(INTERVENTIONS_USED_KEY, 0.0) or 0.0) for m in entropy_metadata]
+        interventions_improved = [
+            float(m.get(INTERVENTIONS_IMPROVED_KEY, 0.0) or 0.0) for m in entropy_metadata
+        ]
         split_indices = [
             float(idx)
             for metadata in entropy_metadata
@@ -401,11 +560,21 @@ class EntropyUpdateTracker:
         treatment_indices = [i for i, is_treatment in enumerate(requested) if is_treatment]
         intervened_indices = [i for i, count in enumerate(interventions) if count > 0]
         non_intervened_indices = [i for i, count in enumerate(interventions) if count == 0]
+        total_interventions = sum(interventions)
+        total_interventions_improved = sum(interventions_improved)
+        treatment_interventions = sum(interventions[i] for i in treatment_indices)
+        treatment_interventions_improved = sum(interventions_improved[i] for i in treatment_indices)
 
         metrics = {
             "entropy/intervention_rate": _safe_mean(requested),
             "entropy/avg_interventions": _safe_mean(interventions),
             "entropy/max_interventions": max(interventions) if interventions else 0.0,
+            "entropy/avg_interventions_improved": _safe_mean(interventions_improved),
+            "entropy/intervention_improvement_rate": (
+                total_interventions_improved / total_interventions
+                if total_interventions
+                else 0.0
+            ),
             "entropy/avg_split_index": _safe_mean(split_indices),
             "entropy/avg_normalized_split_index": _safe_mean(normalized_splits),
             "entropy/split_count": float(len(split_indices)),
@@ -418,6 +587,14 @@ class EntropyUpdateTracker:
             "entropy/control_reward_mean": self._reward_mean(rewards, control_indices),
             "entropy/treatment_reward_mean": self._reward_mean(rewards, treatment_indices),
             "entropy/treatment_interventions_used_mean": _safe_mean(interventions[i] for i in treatment_indices),
+            "entropy/treatment_interventions_improved_mean": _safe_mean(
+                interventions_improved[i] for i in treatment_indices
+            ),
+            "entropy/treatment_intervention_improvement_rate": (
+                treatment_interventions_improved / treatment_interventions
+                if treatment_interventions
+                else 0.0
+            ),
             "entropy/treatment_noop_rate": _rate([interventions[i] == 0 for i in treatment_indices]),
         }
         metrics["entropy/treatment_minus_control_success_rate"] = (
