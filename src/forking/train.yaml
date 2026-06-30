@@ -12,8 +12,10 @@ vllm:
   server_url: "http://127.0.0.1"
   server_port: 8800
   server_timeout: 600.0
+  classifier_update_timeout: 10.0
   max_model_length: 4096
   completions_endpoint: "/v1/entropy_v2/completions"
+  classifier_update_endpoint: "/entropy_v2/update_classifier"
 
 training:
   output_dir: "outputs/grpo_simple"
@@ -50,4 +52,5 @@ entropy:
   classifier_l2: 0.0
   classifier_feature_mode: "combined"
   classifier_hidden_dims: [128, 64, 32]
+  classifier_inference_stride: 16
   classifier_frontier_caps: [0.01, 0.05, 0.075, 0.10, 0.125]

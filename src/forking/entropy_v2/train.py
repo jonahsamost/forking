@@ -29,6 +29,12 @@ def run():
     logger.info("Dataset size: %d", len(dataset))
 
     vllm_url = f"{cfg.vllm.server_url}:{cfg.vllm.server_port}"
+    classifier_update_endpoint = cfg.vllm.get(
+        "classifier_update_endpoint",
+        "/entropy_v2/update_classifier",
+    )
+    if not classifier_update_endpoint.startswith("/"):
+        classifier_update_endpoint = f"/{classifier_update_endpoint}"
     t = cfg.training
 
     # Sync first!
@@ -81,6 +87,8 @@ def run():
         classifier_feature_mode=cfg.entropy.classifier_feature_mode,
         classifier_hidden_dims=list(cfg.entropy.classifier_hidden_dims),
         classifier_frontier_caps=list(cfg.entropy.classifier_frontier_caps),
+        classifier_update_url=f"{vllm_url}{classifier_update_endpoint}",
+        classifier_update_timeout_s=float(cfg.vllm.get("classifier_update_timeout", 10.0)),
     )
 
     trainer = AsyncGRPOTrainer(

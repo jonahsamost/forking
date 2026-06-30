@@ -4,6 +4,7 @@ import logging
 import signal
 import sys
 from pathlib import Path
+from typing import Any
 import uvloop
 from argparse import Namespace
 
@@ -17,7 +18,7 @@ from vllm.v1.engine.core_client import AsyncMPClient
 from vllm.entrypoints.openai.api_server import build_app, init_app_state
 from vllm.entrypoints.launcher import serve_http
 from vllm.entrypoints.openai.completion.protocol import CompletionRequest
-from fastapi import Request
+from fastapi import HTTPException, Request
 
 from forking.entropy_v2.entropy_handler import EntropyHandler
 from forking.utils import load_cfg
@@ -56,6 +57,7 @@ async def run_server(args: Namespace, **uvicorn_kwargs) -> None:
         topk_entropy=cfg.entropy.topk_entropy,
         max_interventions=cfg.entropy.max_interventions,
         num_samples=cfg.entropy.num_samples,
+        classifier_inference_stride=cfg.entropy.classifier_inference_stride,
     )
 
     completions_endpoint = "/v1/entropy_v2/completions"
@@ -67,6 +69,13 @@ async def run_server(args: Namespace, **uvicorn_kwargs) -> None:
     @app.post(completions_endpoint)
     async def _entropy_completions(request: CompletionRequest, raw_request: Request):
         return await entropy_handler.handler(request, raw_request)
+
+    @app.post("/entropy_v2/update_classifier")
+    async def _update_classifier(payload: dict[str, Any]):
+        try:
+            return entropy_handler.update_classifier(payload)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
 
     await init_app_state(engine, app.state, args, supported_tasks)
 

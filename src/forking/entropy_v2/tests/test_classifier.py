@@ -58,7 +58,6 @@ def _make_window(
         down_vix=down_vix,
         drawup=drawup,
         drawdown=drawdown,
-        token_idx_norm=(window_idx + 1) / WINDOWS_PER_COMPLETION,
         vix_max_so_far=vix + 0.001 * window_idx,
         drawup_max_so_far=drawup + 0.001 * window_idx,
         entropy_max_so_far=max(entropy_window),
@@ -104,7 +103,7 @@ def test_train_classifier_snapshot_full_default_scale() -> None:
 
     assert result.params.version == 1
     assert result.params.feature_mode == FEATURE_MODE
-    assert result.params.input_dim == 76
+    assert result.params.input_dim == 75
     assert result.params.hidden_dims == DEFAULT_CLASSIFIER_HIDDEN_DIMS
     assert len(result.params.feature_mean) == result.params.input_dim
     assert len(result.params.feature_std) == result.params.input_dim

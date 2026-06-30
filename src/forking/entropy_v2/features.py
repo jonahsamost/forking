@@ -10,6 +10,9 @@ from forking.entropy_v2.models import (
 )
 
 
+TRAIN_WINDOW_STRIDE = 8
+
+
 @dataclass(frozen=True)
 class EntropyWindowFeatures:
     entropy_window: list[float]
@@ -20,7 +23,6 @@ class EntropyWindowFeatures:
     down_vix: float
     drawup: float
     drawdown: float
-    token_idx_norm: float
     vix_max_so_far: float
     drawup_max_so_far: float
     entropy_max_so_far: float
@@ -128,16 +130,34 @@ def window_feature_rows_from_topk_logprobs(
     topk_logprobs: list[list[float]],
     chunk_size: int,
 ) -> list[EntropyWindowFeatures]:
+    entropies = compute_entropy_trajectory(topk_logprobs)
+    return window_feature_rows_from_entropy_trajectory(
+        entropies,
+        chunk_size,
+        window_stride=TRAIN_WINDOW_STRIDE,
+    )
+
+
+def window_feature_rows_from_entropy_trajectory(
+    entropies: list[float],
+    chunk_size: int,
+    *,
+    window_stride: int = 1,
+    start_idx: int | None = None,
+) -> list[EntropyWindowFeatures]:
     if chunk_size != 64:
         raise ValueError(
             "v1 entropy feature rows currently expect chunk_size=64 "
             f"for raw entropy window features; got {chunk_size}"
         )
-    entropies = compute_entropy_trajectory(topk_logprobs)
+    if window_stride < 1:
+        raise ValueError(f"window_stride must be >= 1, got {window_stride}")
+
     vix_values = compute_rolling_vix(entropies, chunk_size)
     rows: list[EntropyWindowFeatures] = []
+    first_idx = chunk_size - 1 if start_idx is None else max(start_idx, chunk_size - 1)
 
-    for i in range(chunk_size - 1, len(vix_values), chunk_size):
+    for i in range(first_idx, len(vix_values), window_stride):
         vix_so_far = vix_values[: i + 1]
         entropy_so_far = entropies[: i + 1]
         start = i - chunk_size + 1
@@ -152,7 +172,6 @@ def window_feature_rows_from_topk_logprobs(
                 down_vix=float(vix_values[i].down_vix),
                 drawup=float(vix_values[i].drawup),
                 drawdown=float(vix_values[i].drawdown),
-                token_idx_norm=float(i / max(len(entropies) - 1, 1)),
                 vix_max_so_far=float(max(v.vix for v in vix_so_far)),
                 drawup_max_so_far=float(max(v.drawup for v in vix_so_far)),
                 entropy_max_so_far=float(max(entropy_so_far)),

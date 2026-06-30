@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import logging
 import sys
+from concurrent.futures import Future, ThreadPoolExecutor
 from collections import deque
+from copy import deepcopy
 from dataclasses import dataclass
 from statistics import mean
+from threading import Lock
 from typing import Any, Iterable
 
 from forking.entropy_v2.classifier import (
@@ -410,10 +413,18 @@ class EntropyUpdateTracker:
         classifier_feature_mode: str = DEFAULT_CLASSIFIER_FEATURE_MODE,
         classifier_hidden_dims: list[int] | None = None,
         classifier_frontier_caps: list[float] | None = None,
+        classifier_update_url: str | None = None,
+        classifier_update_timeout_s: float = 10.0,
     ):
         self.threshold_chunk_size = threshold_chunk_size
         self.success_classifier_records: deque[EntropyClassifierRecord] = deque(maxlen=max_records)
         self.failure_classifier_records: deque[EntropyClassifierRecord] = deque(maxlen=max_records)
+        self.update_executor = ThreadPoolExecutor(max_workers=1)
+        self._metrics_lock = Lock()
+        self.latest_metrics: dict[str, float] = {}
+        self.update_jobs_submitted = 0
+        self.update_jobs_completed = 0
+        self.last_update_error: str | None = None
         self.classifier_manager = EntropyClassifierManager(
             update_interval=classifier_update_interval,
             min_success_records=classifier_min_success_records,
@@ -425,6 +436,8 @@ class EntropyUpdateTracker:
             hidden_dims=classifier_hidden_dims or list(DEFAULT_CLASSIFIER_HIDDEN_DIMS),
             max_success_trigger_rate=max_success_trigger_rate,
             frontier_caps=classifier_frontier_caps,
+            update_url=classifier_update_url,
+            update_timeout_s=classifier_update_timeout_s,
         )
         self.calibrator = VixThresholdCalibrator(
             max_records=max_records,
@@ -436,11 +449,9 @@ class EntropyUpdateTracker:
 
     def request_xargs(self, sample_idx: int) -> dict[str, Any]:
         # intervene on every-other completion in a group
-        intervene = self.calibrator.ready and (sample_idx % 2 == 1)
-        if not intervene or self.calibrator.thresholds is None:
-            return {ENTROPY_XARGS_INTERVENE_KEY: 0, "sample_idx": sample_idx}
+        intervene = sample_idx % 2 == 1
         return {
-            **self.calibrator.thresholds.as_vllm_xargs(intervene=True),
+            ENTROPY_XARGS_INTERVENE_KEY: int(intervene),
             "sample_idx": sample_idx,
         }
 
@@ -535,6 +546,54 @@ class EntropyUpdateTracker:
             return
 
     def update_from_scored_group(
+        self,
+        rewards: list[float],
+        completion_lengths: list[int],
+        entropy_metadata: list[dict[str, Any]],
+    ) -> dict[str, float]:
+        rewards_snapshot = [float(reward) for reward in rewards]
+        completion_lengths_snapshot = [int(length) for length in completion_lengths]
+        entropy_metadata_snapshot = deepcopy(entropy_metadata)
+
+        with self._metrics_lock:
+            self.update_jobs_submitted += 1
+        future = self.update_executor.submit(
+            self._process_scored_group,
+            rewards_snapshot,
+            completion_lengths_snapshot,
+            entropy_metadata_snapshot,
+        )
+        future.add_done_callback(self._on_scored_group_processed)
+        return self._latest_metrics_snapshot()
+
+    def _latest_metrics_snapshot(self) -> dict[str, float]:
+        with self._metrics_lock:
+            pending = self.update_jobs_submitted - self.update_jobs_completed
+            metrics = dict(self.latest_metrics)
+            metrics.update(
+                {
+                    "entropy/update_background_pending": float(pending),
+                    "entropy/update_background_failed": float(self.last_update_error is not None),
+                }
+            )
+            return metrics
+
+    def _on_scored_group_processed(self, future: Future[dict[str, float]]) -> None:
+        try:
+            metrics = future.result()
+        except Exception as error:
+            logger.exception("Entropy scored-group background update failed")
+            with self._metrics_lock:
+                self.last_update_error = repr(error)
+                self.update_jobs_completed += 1
+            return
+
+        with self._metrics_lock:
+            self.latest_metrics = metrics
+            self.last_update_error = None
+            self.update_jobs_completed += 1
+
+    def _process_scored_group(
         self,
         rewards: list[float],
         completion_lengths: list[int],

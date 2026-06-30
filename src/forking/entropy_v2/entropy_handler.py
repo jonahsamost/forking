@@ -17,13 +17,26 @@ from vllm.entrypoints.utils import get_max_tokens
 from vllm.outputs import CompletionOutput
 
 from fastapi import Request
+from copy import deepcopy
+from dataclasses import fields
+from threading import Lock
 import time
 import uuid
+from typing import Any
 
+import torch
+
+from forking.entropy_v2.classifier import (
+    DEFAULT_CLASSIFIER_ACTIVATION,
+    ClassifierParams,
+    EntropyFailureClassifier,
+)
 from forking.entropy_v2.features import (
+    EntropyWindowFeatures,
     compute_entropy_trajectory,
     compute_rolling_vix,
     sampled_vix_metadata,
+    window_feature_rows_from_entropy_trajectory,
 )
 from forking.entropy_v2.models import (
     INTERVENED_KEY,
@@ -52,6 +65,7 @@ class EntropyHandler:
         topk_entropy: int = 3,
         max_interventions: int = 3,
         num_samples: int = 3,
+        classifier_inference_stride: int = 16,
     ):
         self.engine = engine
         self.model_config = engine.model_config
@@ -66,7 +80,81 @@ class EntropyHandler:
         self.topk_entropy = topk_entropy
         self.max_interventions = max_interventions
         self.num_samples = num_samples
+        self.classifier_inference_stride = classifier_inference_stride
         self.lookahead = 4 * self.chunk_size
+        self.classifier_params: ClassifierParams | None = None
+        self.classifier_model: EntropyFailureClassifier | None = None
+        self.classifier_feature_names: list[str] = []
+        self.classifier_version = 0
+        self._classifier_lock = Lock()
+
+    def update_classifier(self, payload: dict[str, Any]) -> dict[str, int | str]:
+        required_keys = {field.name for field in fields(ClassifierParams)} | {
+            "feature_names"
+        }
+        missing_keys = sorted(required_keys - set(payload))
+        if missing_keys:
+            raise ValueError(f"Missing classifier payload keys: {missing_keys}")
+        if not isinstance(payload["state_dict"], dict):
+            raise ValueError("Classifier state_dict must be an object")
+
+        params = ClassifierParams(
+            version=int(payload["version"]),
+            feature_mode=str(payload["feature_mode"]),
+            input_dim=int(payload["input_dim"]),
+            hidden_dims=[int(value) for value in payload["hidden_dims"]],
+            activation=str(payload["activation"]),
+            state_dict=deepcopy(payload["state_dict"]),
+            feature_mean=[float(value) for value in payload["feature_mean"]],
+            feature_std=[float(value) for value in payload["feature_std"]],
+            threshold=float(payload["threshold"]),
+            max_success_trigger_rate=float(payload["max_success_trigger_rate"]),
+        )
+        input_dim = params.input_dim
+        feature_mean = params.feature_mean
+        feature_std = params.feature_std
+        feature_names = [str(value) for value in payload["feature_names"]]
+        if len(feature_mean) != input_dim:
+            raise ValueError(
+                "Classifier feature_mean length does not match input_dim: "
+                f"len={len(feature_mean)} input_dim={input_dim}"
+            )
+        if len(feature_std) != input_dim:
+            raise ValueError(
+                "Classifier feature_std length does not match input_dim: "
+                f"len={len(feature_std)} input_dim={input_dim}"
+            )
+        if len(feature_names) != input_dim:
+            raise ValueError(
+                "Classifier feature_names length does not match input_dim: "
+                f"len={len(feature_names)} input_dim={input_dim}"
+            )
+        if params.activation != DEFAULT_CLASSIFIER_ACTIVATION:
+            raise ValueError(f"Unsupported classifier activation: {params.activation}")
+
+        model = EntropyFailureClassifier(
+            input_dim=params.input_dim,
+            hidden_dims=params.hidden_dims,
+        ).cpu()
+        try:
+            model.load_state_dict(
+                {
+                    key: torch.tensor(value, dtype=torch.float32, device="cpu")
+                    for key, value in params.state_dict.items()
+                },
+                strict=True,
+            )
+        except (RuntimeError, TypeError, ValueError) as error:
+            raise ValueError("Invalid classifier state_dict") from error
+        model.eval()
+
+        with self._classifier_lock:
+            self.classifier_params = params
+            self.classifier_model = model
+            self.classifier_feature_names = feature_names
+            self.classifier_version = params.version
+
+        return {"status": "ok", "version": params.version}
 
     def _calculate_entropy_trajectory(
         self, output: CompletionOutput, 
@@ -141,49 +229,104 @@ class EntropyHandler:
             f"entropies={len(entropies)}"
         )
 
-    def _vix_instability_score(self, v: VixValues, xargs: EntropyXargs) -> float:
-        tau_vix = getattr(xargs, "tau_vix", None)
-        tau_drift = getattr(xargs, "tau_drift", None)
-        tau_drawup = getattr(xargs, "tau_drawup", None)
-        score = 0.0
-        if tau_vix is not None:
-            vix_excess = max(0.0, v.vix - tau_vix)
-            if vix_excess > 0.0:
-                direction_excess = 0.0
-                if tau_drift is not None:
-                    direction_excess = max(direction_excess, v.drift - tau_drift)
-                if tau_drawup is not None:
-                    direction_excess = max(direction_excess, v.drawup - tau_drawup)
-                if direction_excess > 0.0:
-                    score = max(score, vix_excess + direction_excess)
-        if tau_drawup is not None:
-            score = max(score, v.drawup - tau_drawup)
-        return max(0.0, score)
+    def _current_classifier_snapshot(
+        self,
+    ) -> tuple[ClassifierParams, EntropyFailureClassifier] | None:
+        with self._classifier_lock:
+            if self.classifier_params is None or self.classifier_model is None:
+                return None
+            return self.classifier_params, self.classifier_model
+
+    @staticmethod
+    def _classifier_vector(
+        features: EntropyWindowFeatures,
+        params: ClassifierParams,
+    ) -> list[float]:
+        if params.feature_mode == "entropy_window":
+            return features.entropy_window_vector()
+        if params.feature_mode == "combined":
+            return features.combined_vector()
+        raise ValueError(f"Unsupported classifier feature mode: {params.feature_mode}")
+
+    def _classifier_scores_for_generated_tokens(
+        self,
+        local_entropies: list[float],
+        *,
+        generated_start_idx: int,
+        params: ClassifierParams,
+        model: EntropyFailureClassifier,
+    ) -> list[tuple[int, float]]:
+        start_idx = max(generated_start_idx, self.chunk_size - 1)
+        rows = window_feature_rows_from_entropy_trajectory(
+            local_entropies,
+            self.chunk_size,
+            window_stride=self.classifier_inference_stride,
+            start_idx=start_idx,
+        )
+        if not rows:
+            return []
+
+        vectors = [self._classifier_vector(features, params) for features in rows]
+        for vector in vectors:
+            if len(vector) != params.input_dim:
+                raise ValueError(
+                    "Classifier feature dimension mismatch: "
+                    f"features={len(vector)} input_dim={params.input_dim}"
+                )
+        X = torch.tensor(vectors, dtype=torch.float32, device="cpu")
+        mean = torch.tensor(params.feature_mean, dtype=torch.float32, device="cpu")
+        std = torch.tensor(params.feature_std, dtype=torch.float32, device="cpu")
+        with torch.no_grad():
+            probabilities = torch.sigmoid(model((X - mean) / std)).detach().cpu().tolist()
+
+        return [
+            (
+                start_idx
+                + row_offset * self.classifier_inference_stride
+                - generated_start_idx,
+                float(probability),
+            )
+            for row_offset, probability in enumerate(probabilities)
+        ]
 
     def _find_split_idx(
         self,
-        vix_values: list[VixValues],
-        xargs: EntropyXargs,
+        local_entropies: list[float],
+        *,
+        generated_start_idx: int,
+        params: ClassifierParams,
+        model: EntropyFailureClassifier,
     ) -> int | None:
         best_local_idx = None
-        best_score = 0.0
-        for local_idx, vix_value in enumerate(vix_values):
-            score = self._vix_instability_score(vix_value, xargs)
-            if score > best_score:
-                best_score = score
+        best_probability = params.threshold
+        for local_idx, probability in self._classifier_scores_for_generated_tokens(
+            local_entropies,
+            generated_start_idx=generated_start_idx,
+            params=params,
+            model=model,
+        ):
+            if probability >= best_probability:
+                best_probability = probability
                 best_local_idx = local_idx
         return best_local_idx
 
     def _branch_score(
-        self, branch_vix_values: list[VixValues],
+        self,
+        local_entropies: list[float],
+        *,
+        generated_start_idx: int,
+        params: ClassifierParams,
+        model: EntropyFailureClassifier,
     ) -> float:
-        if not branch_vix_values:
-            return 0.0
-        return (
-            sum(v.vix for v in branch_vix_values) / len(branch_vix_values)
-            + sum(max(v.drift, 0.0) for v in branch_vix_values) / len(branch_vix_values)
-            + max(v.drawup for v in branch_vix_values)
+        scores = self._classifier_scores_for_generated_tokens(
+            local_entropies,
+            generated_start_idx=generated_start_idx,
+            params=params,
+            model=model,
         )
+        if not scores:
+            return 0.0
+        return max(probability for _, probability in scores)
 
     @staticmethod
     def _is_terminal_finish_reason(finish_reason: str | None) -> bool:
@@ -256,7 +399,10 @@ class EntropyHandler:
 
         prompt_ids = list(request.prompt)
         engine_input = tokens_input(prompt_token_ids=prompt_ids)
-        xargs = EntropyXargs.from_dict(request.vllm_xargs)
+        classifier_snapshot = self._current_classifier_snapshot()
+        if classifier_snapshot is None:
+            return await self.non_intervention_handler(request, raw_request)
+        params, model = classifier_snapshot
 
         max_tokens = get_max_tokens(
             max_model_len,
@@ -304,19 +450,13 @@ class EntropyHandler:
             chunk_entropies = self._calculate_entropy_trajectory(output)
             self._assert_aligned(chunk_ids, chunk_logprobs, chunk_entropies)
 
-            prior_entropies = all_entropies[-(self.chunk_size - 1):]
-            local_entropies = prior_entropies + chunk_entropies
-            local_vix = self._rolling_vix(local_entropies)
-            chunk_vix = local_vix[len(prior_entropies):]
-            assert len(chunk_vix) == len(chunk_entropies), (
-                "Misaligned chunk VIX: "
-                f"chunk_vix={len(chunk_vix)}, "
-                f"chunk_entropies={len(chunk_entropies)}"
-            )
+            local_entropies = all_entropies + chunk_entropies
 
             detected_idx = self._find_split_idx(
-                chunk_vix,
-                xargs=xargs,
+                local_entropies,
+                generated_start_idx=len(all_entropies),
+                params=params,
+                model=model,
             )
 
             if detected_idx is None:
@@ -337,12 +477,18 @@ class EntropyHandler:
             self._assert_aligned(keep_ids, keep_logprobs, keep_entropies)
             branch_prompt_ids = prompt_ids + all_token_ids + keep_ids
             branch_max_tokens = max(1, len(chunk_ids) - split_idx)
-            original_tail_score = self._branch_score(chunk_vix[split_idx:])
+            original_tail_entropies = all_entropies + chunk_entropies
+            original_tail_score = self._branch_score(
+                original_tail_entropies,
+                generated_start_idx=len(all_entropies) + split_idx,
+                params=params,
+                model=model,
+            )
     
             best_branch = None
             best_branch_logprobs = None
             best_branch_entropies = None
-            best_branch_score = float("inf")
+            best_branch_score = original_tail_score
 
             branch_outputs = await self._generate(
                 branch_prompt_ids,
@@ -358,18 +504,13 @@ class EntropyHandler:
                 self._assert_aligned(
                     list(branch_output.token_ids), branch_logprobs, branch_entropies
                 )
-                branch_prior_entropies = (all_entropies + keep_entropies)[
-                    -(self.chunk_size - 1):
-                ]
-                branch_local_entropies = branch_prior_entropies + branch_entropies
-                branch_local_vix = self._rolling_vix(branch_local_entropies)
-                branch_vix = branch_local_vix[len(branch_prior_entropies):]
-                assert len(branch_vix) == len(branch_entropies), (
-                    "Misaligned branch VIX: "
-                    f"branch_vix={len(branch_vix)}, "
-                    f"branch_entropies={len(branch_entropies)}"
+                branch_local_entropies = all_entropies + keep_entropies + branch_entropies
+                score = self._branch_score(
+                    branch_local_entropies,
+                    generated_start_idx=len(all_entropies) + len(keep_entropies),
+                    params=params,
+                    model=model,
                 )
-                score = self._branch_score(branch_vix)
                 if score < best_branch_score:
                     best_branch_score = score
                     best_branch = branch_output

@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import json
 import logging
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import asdict
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 from forking.entropy_v2.classifier import (
     DEFAULT_CLASSIFIER_FEATURE_MODE,
@@ -11,6 +15,11 @@ from forking.entropy_v2.classifier import (
     ClassifierTrainingResult,
     EntropyClassifierRecord,
     _train_classifier_snapshot,
+)
+from forking.entropy_v2.features import (
+    COMBINED_FEATURE_NAMES,
+    ENTROPY_WINDOW_FEATURE_NAMES,
+    SUMMARY_FEATURE_NAMES,
 )
 
 logger = logging.getLogger(__name__)
@@ -30,6 +39,8 @@ class EntropyClassifierManager:
         feature_mode: str = DEFAULT_CLASSIFIER_FEATURE_MODE,
         hidden_dims: list[int] | None = None,
         frontier_caps: list[float] | None = None,
+        update_url: str | None = None,
+        update_timeout_s: float = 10.0,
     ):
         self.update_interval = update_interval
         self.min_success_records = min_success_records
@@ -41,6 +52,8 @@ class EntropyClassifierManager:
         self.hidden_dims = list(hidden_dims or DEFAULT_CLASSIFIER_HIDDEN_DIMS)
         self.max_success_trigger_rate = max_success_trigger_rate
         self.frontier_caps = list(frontier_caps or DEFAULT_CLASSIFIER_FRONTIER_CAPS)
+        self.update_url = update_url
+        self.update_timeout_s = update_timeout_s
         if self.max_success_trigger_rate not in self.frontier_caps:
             raise ValueError(
                 "max_success_trigger_rate must be one of classifier_frontier_caps: "
@@ -55,6 +68,8 @@ class EntropyClassifierManager:
         self.records_since_update = 0
         self.last_result: ClassifierTrainingResult | None = None
         self.last_error: str | None = None
+        self.last_pushed_version = 0
+        self.last_push_error: str | None = None
 
     def note_record_added(self) -> None:
         self.records_since_update += 1
@@ -109,6 +124,51 @@ class EntropyClassifierManager:
         self.last_error = None
         self.records_since_update = 0
         self._log_classifier_frontier(result)
+        self._push_classifier_params(result.params)
+
+    @staticmethod
+    def _feature_names_for_mode(feature_mode: str) -> list[str]:
+        if feature_mode == "entropy_window":
+            return list(ENTROPY_WINDOW_FEATURE_NAMES)
+        if feature_mode == "combined":
+            return list(COMBINED_FEATURE_NAMES)
+        return list(SUMMARY_FEATURE_NAMES)
+
+    def _classifier_update_payload(self, params: ClassifierParams) -> dict[str, object]:
+        payload = asdict(params)
+        payload["feature_names"] = self._feature_names_for_mode(params.feature_mode)
+        return payload
+
+    def _push_classifier_params(self, params: ClassifierParams) -> None:
+        if self.update_url is None:
+            return
+
+        body = json.dumps(self._classifier_update_payload(params)).encode("utf-8")
+        request = Request(
+            self.update_url,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=self.update_timeout_s) as response:
+                response.read()
+        except (HTTPError, URLError, TimeoutError, OSError) as error:
+            self.last_push_error = repr(error)
+            logger.exception(
+                "Entropy classifier push failed: version=%s url=%s",
+                params.version,
+                self.update_url,
+            )
+            return
+
+        self.last_pushed_version = params.version
+        self.last_push_error = None
+        logger.info(
+            "Entropy classifier pushed to server: version=%s url=%s",
+            params.version,
+            self.update_url,
+        )
 
     def _log_classifier_frontier(self, result: ClassifierTrainingResult) -> None:
         parts = [
@@ -154,6 +214,8 @@ class EntropyClassifierManager:
             ),
             "entropy/classifier_version": float(self.version),
             "entropy/classifier_records_since_update": float(self.records_since_update),
+            "entropy/classifier_pushed_version": float(self.last_pushed_version),
+            "entropy/classifier_push_failed": float(self.last_push_error is not None),
             "entropy/classifier_record_success_count": float(len(success_records)),
             "entropy/classifier_record_failure_count": float(len(failure_records)),
             "entropy/classifier_record_window_success_count": float(
