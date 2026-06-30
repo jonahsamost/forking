@@ -449,7 +449,7 @@ class EntropyUpdateTracker:
 
     def request_xargs(self, sample_idx: int) -> dict[str, Any]:
         # intervene on every-other completion in a group
-        intervene = sample_idx % 2 == 1
+        intervene = sample_idx % 2 == 1 and self.classifier_manager.version > 0
         return {
             ENTROPY_XARGS_INTERVENE_KEY: int(intervene),
             "sample_idx": sample_idx,

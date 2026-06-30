@@ -75,6 +75,7 @@ async def run_server(args: Namespace, **uvicorn_kwargs) -> None:
         try:
             return entropy_handler.update_classifier(payload)
         except ValueError as error:
+            print(f'Update classifier error! {error}')
             raise HTTPException(status_code=400, detail=str(error)) from error
 
     await init_app_state(engine, app.state, args, supported_tasks)
