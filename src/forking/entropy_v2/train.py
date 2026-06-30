@@ -37,7 +37,7 @@ def run():
         Path(__file__).resolve().parent / "../../trl/trl/chat_templates/qwen3.jinja",
     )
 
-    from forking.entropy.entropy_updates import EntropyUpdateTracker
+    from forking.entropy_v2.entropy_updates import EntropyUpdateTracker
     from trl.experimental.async_grpo import AsyncGRPOConfig, AsyncGRPOTrainer
     config = AsyncGRPOConfig(
         output_dir=t.output_dir,
@@ -56,7 +56,7 @@ def run():
         seed=t.seed,
         bf16=cfg.model.dtype == "bfloat16",
         vllm_server_base_url=vllm_url,
-        vllm_completions_endpoint=cfg.vllm.get("completions_endpoint", "/v1/completions"),
+        vllm_completions_endpoint="/v1/entropy_v2/completions",
         vllm_server_timeout=cfg.vllm.server_timeout,
         log_completions=False,
         chat_template_kwargs={"enable_thinking": False},
@@ -71,6 +71,16 @@ def run():
         calibration_ema=cfg.entropy.calibration_ema,
         max_success_trigger_rate=cfg.entropy.max_success_trigger_rate,
         max_records=cfg.entropy.max_records,
+        threshold_chunk_size=cfg.entropy.threshold_chunk_size,
+        classifier_update_interval=cfg.entropy.classifier_update_interval,
+        classifier_min_success_records=cfg.entropy.classifier_min_success_records,
+        classifier_min_failure_records=cfg.entropy.classifier_min_failure_records,
+        classifier_train_steps=cfg.entropy.classifier_train_steps,
+        classifier_learning_rate=cfg.entropy.classifier_learning_rate,
+        classifier_l2=cfg.entropy.classifier_l2,
+        classifier_feature_mode=cfg.entropy.classifier_feature_mode,
+        classifier_hidden_dims=list(cfg.entropy.classifier_hidden_dims),
+        classifier_frontier_caps=list(cfg.entropy.classifier_frontier_caps),
     )
 
     trainer = AsyncGRPOTrainer(

@@ -13,7 +13,7 @@ vllm:
   server_port: 8800
   server_timeout: 600.0
   max_model_length: 4096
-  completions_endpoint: "/v1/entropy/completions"
+  completions_endpoint: "/v1/entropy_v2/completions"
 
 training:
   output_dir: "outputs/grpo_simple"
@@ -41,3 +41,13 @@ entropy:
   calibration_batches: 1 
   calibration_ema: 0.95
   max_success_trigger_rate: 0.1
+  max_records: 2048
+  classifier_update_interval: 64 # update after 64 new completions
+  classifier_min_success_records: 64
+  classifier_min_failure_records: 64
+  classifier_train_steps: 1000
+  classifier_learning_rate: 0.01
+  classifier_l2: 0.0
+  classifier_feature_mode: "combined"
+  classifier_hidden_dims: [128, 64, 32]
+  classifier_frontier_caps: [0.01, 0.05, 0.075, 0.10, 0.125]

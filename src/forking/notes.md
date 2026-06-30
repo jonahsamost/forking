@@ -12,3 +12,4 @@ Entropy + VIX
     calibration_batches: 1 
     calibration_ema: 0.95
     max_success_trigger_rate: 0.1
+    max_records: 1024
