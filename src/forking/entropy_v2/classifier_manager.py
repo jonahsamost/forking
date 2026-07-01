@@ -17,9 +17,9 @@ from forking.entropy_v2.classifier import (
     _train_classifier_snapshot,
 )
 from forking.entropy_v2.features import (
-    COMBINED_FEATURE_NAMES,
-    ENTROPY_WINDOW_FEATURE_NAMES,
     SUMMARY_FEATURE_NAMES,
+    combined_feature_names,
+    entropy_window_feature_names,
 )
 
 logger = logging.getLogger(__name__)
@@ -29,6 +29,7 @@ class EntropyClassifierManager:
     def __init__(
         self,
         *,
+        chunk_size: int = 64,
         update_interval: int,
         min_success_records: int,
         min_failure_records: int,
@@ -42,6 +43,7 @@ class EntropyClassifierManager:
         update_url: str | None = None,
         update_timeout_s: float = 10.0,
     ):
+        self.chunk_size = chunk_size
         self.update_interval = update_interval
         self.min_success_records = min_success_records
         self.min_failure_records = min_failure_records
@@ -126,12 +128,11 @@ class EntropyClassifierManager:
         self._log_classifier_frontier(result)
         self._push_classifier_params(result.params)
 
-    @staticmethod
-    def _feature_names_for_mode(feature_mode: str) -> list[str]:
+    def _feature_names_for_mode(self, feature_mode: str) -> list[str]:
         if feature_mode == "entropy_window":
-            return list(ENTROPY_WINDOW_FEATURE_NAMES)
+            return entropy_window_feature_names(self.chunk_size)
         if feature_mode == "combined":
-            return list(COMBINED_FEATURE_NAMES)
+            return combined_feature_names(self.chunk_size)
         return list(SUMMARY_FEATURE_NAMES)
 
     def _classifier_update_payload(self, params: ClassifierParams) -> dict[str, object]:

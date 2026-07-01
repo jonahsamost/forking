@@ -35,22 +35,19 @@ training:
   warmup_ratio: 0.05
 
 entropy:
-  threshold_chunk_size: 64
+  threshold_chunk_size: 48
   topk_entropy: 3
-  max_interventions: 3
-  num_samples: 3
-  update_interval: 64
-  calibration_batches: 1 
-  calibration_ema: 0.95
+  max_interventions: 4
+  num_samples: 4
   max_success_trigger_rate: 0.1
-  max_records: 2048
-  classifier_update_interval: 64 # update after 64 new completions
-  classifier_min_success_records: 64
-  classifier_min_failure_records: 64
+  max_records: 256
+  classifier_update_interval: 32 # update after n new completions
+  classifier_min_success_records: 128
+  classifier_min_failure_records: 128
   classifier_train_steps: 1000
   classifier_learning_rate: 0.01
   classifier_l2: 0.0
   classifier_feature_mode: "combined"
   classifier_hidden_dims: [128, 64, 32]
   classifier_inference_stride: 16
-  classifier_frontier_caps: [0.01, 0.05, 0.075, 0.10, 0.125]
+  classifier_frontier_caps: [0.10, 0.15, 0.20, 0.25]

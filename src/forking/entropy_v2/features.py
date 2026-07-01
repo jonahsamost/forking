@@ -35,8 +35,6 @@ class EntropyWindowFeatures:
         return self.summary_vector()
 
     def entropy_window_vector(self) -> list[float]:
-        if len(self.entropy_window) != 64:
-            raise ValueError(f"Expected 64 entropy values, got {len(self.entropy_window)}")
         return [float(value) for value in self.entropy_window]
 
     def combined_vector(self) -> list[float]:
@@ -44,9 +42,15 @@ class EntropyWindowFeatures:
 
 
 SUMMARY_FEATURE_NAMES = [field.name for field in fields(EntropyWindowFeatures) if field.name != "entropy_window"]
-ENTROPY_WINDOW_FEATURE_NAMES = [f"entropy_pos_{i}" for i in range(64)]
-COMBINED_FEATURE_NAMES = SUMMARY_FEATURE_NAMES + ENTROPY_WINDOW_FEATURE_NAMES
 FEATURE_NAMES = SUMMARY_FEATURE_NAMES
+
+
+def entropy_window_feature_names(chunk_size: int) -> list[str]:
+    return [f"entropy_pos_{i}" for i in range(chunk_size)]
+
+
+def combined_feature_names(chunk_size: int) -> list[str]:
+    return SUMMARY_FEATURE_NAMES + entropy_window_feature_names(chunk_size)
 
 
 def compute_entropy_trajectory(topk_logprobs: list[list[float]]) -> list[float]:
@@ -145,11 +149,6 @@ def window_feature_rows_from_entropy_trajectory(
     window_stride: int = 1,
     start_idx: int | None = None,
 ) -> list[EntropyWindowFeatures]:
-    if chunk_size != 64:
-        raise ValueError(
-            "v1 entropy feature rows currently expect chunk_size=64 "
-            f"for raw entropy window features; got {chunk_size}"
-        )
     if window_stride < 1:
         raise ValueError(f"window_stride must be >= 1, got {window_stride}")
 

@@ -469,7 +469,16 @@ class EntropyHandler:
                     break
                 continue
 
-            split_idx = max(0, detected_idx - self.chunk_size + 1)
+            window_start = max(0, detected_idx - self.chunk_size + 1)
+            abs_window_start = len(all_entropies) + window_start
+            abs_window_end = len(all_entropies) + detected_idx
+            vix_context_start = max(0, abs_window_start - self.chunk_size + 1)
+            vix_entropies = local_entropies[vix_context_start:abs_window_end + 1]
+            vix_values = compute_rolling_vix(vix_entropies, self.chunk_size)
+            vix_offset = abs_window_start - vix_context_start
+            window_vix = vix_values[vix_offset:]
+            max_vix_pos = max(range(len(window_vix)), key=lambda i: window_vix[i].vix)
+            split_idx = max(0, window_start + max_vix_pos - 1)
             split_indices.append(len(all_token_ids) + split_idx)
             keep_ids = chunk_ids[:split_idx]
             keep_logprobs = chunk_logprobs[:split_idx]

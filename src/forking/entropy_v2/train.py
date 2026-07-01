@@ -70,11 +70,7 @@ def run():
         warmup_ratio=t.warmup_ratio,
         lr_scheduler_type=t.lr_scheduler_type,
     )
-    single_dev_bs = t.gradient_accumulation_steps * t.per_device_train_batch_size
     entropy_tracker = EntropyUpdateTracker(
-        bootstrap_records=single_dev_bs,
-        update_interval=cfg.entropy.update_interval,
-        calibration_ema=cfg.entropy.calibration_ema,
         max_success_trigger_rate=cfg.entropy.max_success_trigger_rate,
         max_records=cfg.entropy.max_records,
         threshold_chunk_size=cfg.entropy.threshold_chunk_size,

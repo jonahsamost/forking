@@ -5,7 +5,6 @@ import sys
 from concurrent.futures import Future, ThreadPoolExecutor
 from collections import deque
 from copy import deepcopy
-from dataclasses import dataclass
 from statistics import mean
 from threading import Lock
 from typing import Any, Iterable
@@ -57,351 +56,14 @@ def _safe_mean(values: Iterable[float]) -> float:
     return float(mean(vals)) if vals else 0.0
 
 
-def _quantile(values: list[float], q: float) -> float:
-    if not values:
-        return 0.0
-    sorted_values = sorted(float(v) for v in values)
-    if len(sorted_values) == 1:
-        return sorted_values[0]
-    pos = (len(sorted_values) - 1) * q
-    lo = int(pos)
-    hi = min(lo + 1, len(sorted_values) - 1)
-    frac = pos - lo
-    return sorted_values[lo] * (1.0 - frac) + sorted_values[hi] * frac
-
-
 def _rate(values: list[bool]) -> float:
     return (sum(1 for v in values if v) / len(values)) if values else 0.0
-
-
-@dataclass(frozen=True)
-class VixThresholds:
-    tau_vix: float
-    tau_drift: float
-    tau_drawup: float
-
-    def as_vllm_xargs(self, intervene: bool) -> dict[str, float | int]:
-        return {
-            ENTROPY_XARGS_INTERVENE_KEY: int(intervene),
-            "tau_vix": self.tau_vix,
-            "tau_drift": self.tau_drift,
-            "tau_drawup": self.tau_drawup,
-        }
-
-
-@dataclass(frozen=True)
-class VixCalibrationRecord:
-    reward: float
-    completion_len: int
-    vix_max: float
-    drift_max: float
-    drawup_max: float
-
-    @property
-    def success(self) -> bool:
-        return self.reward > 0
-
-
-class VixThresholdCalibrator:
-    def __init__(
-        self,
-        max_records: int,
-        bootstrap_records: int,
-        update_interval: int,
-        calibration_ema: float,
-        min_successes: int = 8,
-        min_failures: int = 8,
-        max_success_trigger_rate: float = 0.05,
-    ):
-        self.success_records: deque[VixCalibrationRecord] = deque(maxlen=max_records)
-        self.failure_records: deque[VixCalibrationRecord] = deque(maxlen=max_records)
-        self.bootstrap_records = bootstrap_records
-        self.update_interval = update_interval
-        self.calibration_ema = calibration_ema
-        self.min_successes = min_successes
-        self.min_failures = min_failures
-        self.max_success_trigger_rate = max_success_trigger_rate
-        self.thresholds: VixThresholds | None = None
-        self.new_records_since_update = 0
-        self.update_count = 0
-        self.last_fit_method = "none"
-        self.last_youden_j = 0.0
-        self.last_trigger_rate_success = 0.0
-        self.last_trigger_rate_failure = 0.0
-        self._logged_min_successes = False
-        self._logged_min_failures = False
-        self._logged_labeled_calibration_ready = False
-
-    @property
-    def ready(self) -> bool:
-        return self.thresholds is not None
-
-    def add_completion(self, record: VixCalibrationRecord) -> None:
-        if record.success:
-            self.success_records.append(record)
-        else:
-            self.failure_records.append(record)
-        self.new_records_since_update += 1
-        self._log_buffer_milestones()
-
-    def _log_buffer_milestones(self) -> None:
-        success_count = len(self.success_records)
-        failure_count = len(self.failure_records)
-        if not self._logged_min_successes and success_count >= self.min_successes:
-            logger.info(
-                "VIX calibration has enough successful controls: "
-                f"{success_count}/{self.min_successes}"
-            )
-            self._logged_min_successes = True
-        if not self._logged_min_failures and failure_count >= self.min_failures:
-            logger.info(
-                "VIX calibration has enough failed controls: "
-                f"{failure_count}/{self.min_failures}"
-            )
-            self._logged_min_failures = True
-        if (
-            not self._logged_labeled_calibration_ready
-            and success_count >= self.min_successes
-            and failure_count >= self.min_failures
-        ):
-            logger.info(
-                "VIX labeled calibration is ready: "
-                f"successes={success_count}, failures={failure_count}"
-            )
-            self._logged_labeled_calibration_ready = True
-
-    def maybe_update(self) -> VixThresholds | None:
-        if self._num_records < self.bootstrap_records:
-            return self.thresholds
-        if self.thresholds is not None and self.new_records_since_update < self.update_interval:
-            return self.thresholds
-
-        fitted = self._fit_thresholds()
-        if fitted is None:
-            self.last_fit_method = "skipped"
-            return self.thresholds
-        used_ema = self.thresholds is not None and self._any_buffer_full
-        if self.thresholds is None or not self._any_buffer_full:
-            self.thresholds = fitted
-        else:
-            ema = self.calibration_ema
-            self.thresholds = VixThresholds(
-                tau_vix=ema * self.thresholds.tau_vix + (1.0 - ema) * fitted.tau_vix,
-                tau_drift=ema * self.thresholds.tau_drift + (1.0 - ema) * fitted.tau_drift,
-                tau_drawup=ema * self.thresholds.tau_drawup + (1.0 - ema) * fitted.tau_drawup,
-            )
-        self.new_records_since_update = 0
-        self.update_count += 1
-        self._update_trigger_metrics(self.thresholds)
-        logger.info(
-            "VIX thresholds updated: update_count=%s fit_method=%s "
-            "tau_vix=%.4f tau_drift=%.4f tau_drawup=%.4f "
-            "trigger_rate_success=%.4f trigger_rate_failure=%.4f youden_j=%.4f "
-            "max_success_trigger_rate=%.4f used_ema=%s success_records=%s failure_records=%s",
-            self.update_count,
-            self.last_fit_method,
-            self.thresholds.tau_vix,
-            self.thresholds.tau_drift,
-            self.thresholds.tau_drawup,
-            self.last_trigger_rate_success,
-            self.last_trigger_rate_failure,
-            self.last_youden_j,
-            self.max_success_trigger_rate,
-            used_ema,
-            len(self.success_records),
-            len(self.failure_records),
-        )
-        return self.thresholds
-
-    @property
-    def _num_records(self) -> int:
-        return len(self.success_records) + len(self.failure_records)
-
-    @property
-    def _any_buffer_full(self) -> bool:
-        return len(self.success_records) == self.success_records.maxlen or len(self.failure_records) == self.failure_records.maxlen
-
-    def _records(self) -> list[VixCalibrationRecord]:
-        return [*self.success_records, *self.failure_records]
-
-    def _fit_thresholds(self) -> VixThresholds | None:
-        records = self._records()
-        successes = list(self.success_records)
-        failures = list(self.failure_records)
-        if len(successes) >= self.min_successes and len(failures) >= self.min_failures:
-            self.last_fit_method = "separation"
-            return self._fit_by_labeled_separation(records, successes, failures)
-        if len(successes) < self.min_successes:
-            self.last_fit_method = "skipped"
-            return None
-        self.last_fit_method = "success_quantile"
-        return VixThresholds(
-            tau_vix=_quantile([r.vix_max for r in successes], 0.95),
-            tau_drift=_quantile([r.drift_max for r in successes], 0.95),
-            tau_drawup=_quantile([r.drawup_max for r in successes], 0.95),
-        )
-
-    def _fit_by_labeled_separation(
-        self,
-        records: list[VixCalibrationRecord],
-        successes: list[VixCalibrationRecord],
-        failures: list[VixCalibrationRecord],
-    ) -> VixThresholds:
-        quantiles = [0.50, 0.60, 0.70, 0.80, 0.90, 0.925, 0.95, 0.975, 0.99]
-        vix_candidates = sorted({ _quantile([r.vix_max for r in records], q) for q in quantiles })
-        drift_candidates = sorted({ _quantile([r.drift_max for r in records], q) for q in quantiles })
-        drawup_candidates = sorted({ _quantile([r.drawup_max for r in records], q) for q in quantiles })
-
-        best: tuple[VixThresholds, float, float] | None = None
-        best_failure_rate = float("-inf")
-        fallback: tuple[VixThresholds, float, float] | None = None
-        fallback_key: tuple[float, float] | None = None
-        best_success_rate = 0.0
-        candidates: list[tuple[VixThresholds, float, float]] = []
-        for tau_vix in vix_candidates:
-            for tau_drift in drift_candidates:
-                for tau_drawup in drawup_candidates:
-                    thresholds = VixThresholds(tau_vix, tau_drift, tau_drawup)
-                    success_rate = self._trigger_rate(successes, thresholds)
-                    failure_rate = self._trigger_rate(failures, thresholds)
-                    candidates.append((thresholds, success_rate, failure_rate))
-
-                    fallback_candidate_key = (-success_rate, failure_rate)
-                    if fallback_key is None or fallback_candidate_key > fallback_key:
-                        fallback_key = fallback_candidate_key
-                        fallback = (thresholds, success_rate, failure_rate)
-
-                    if success_rate > self.max_success_trigger_rate:
-                        continue
-
-                    if best is None or (failure_rate, -success_rate) > (
-                        best_failure_rate,
-                        -best_success_rate,
-                    ):
-                        best_failure_rate = failure_rate
-                        best_success_rate = success_rate
-                        best = (thresholds, success_rate, failure_rate)
-
-        if best is None:
-            assert fallback is not None, "Expected at least one VIX threshold candidate"
-            selected, best_success_rate, best_failure_rate = fallback
-        else:
-            selected, best_success_rate, best_failure_rate = best
-
-        self.last_youden_j = best_failure_rate - best_success_rate
-        self.last_trigger_rate_success = best_success_rate
-        self.last_trigger_rate_failure = best_failure_rate
-        self._log_separation_frontier(candidates)
-        return selected
-
-    def _log_separation_frontier(
-        self,
-        candidates: list[tuple[VixThresholds, float, float]],
-    ) -> None:
-        caps = [0.0, 0.01, 0.025, 0.05, .075, 0.10, 0.15]
-        parts = []
-        for cap in caps:
-            feasible = [
-                (thresholds, success_rate, failure_rate)
-                for thresholds, success_rate, failure_rate in candidates
-                if success_rate <= cap
-            ]
-            if not feasible:
-                parts.append(f"cap<={cap:.3f}:none")
-                continue
-            thresholds, success_rate, failure_rate = max(
-                feasible,
-                key=lambda candidate: (candidate[2], -candidate[1]),
-            )
-            parts.append(
-                "cap<=%.3f success=%.4f failure=%.4f youden=%.4f "
-                "tau=(%.4f,%.4f,%.4f)"
-                % (
-                    cap,
-                    success_rate,
-                    failure_rate,
-                    failure_rate - success_rate,
-                    thresholds.tau_vix,
-                    thresholds.tau_drift,
-                    thresholds.tau_drawup,
-                )
-            )
-        logger.info("VIX separation frontier: %s", " | ".join(parts))
-
-    def _update_trigger_metrics(self, thresholds: VixThresholds) -> None:
-        successes = list(self.success_records)
-        failures = list(self.failure_records)
-        self.last_trigger_rate_success = self._trigger_rate(successes, thresholds)
-        self.last_trigger_rate_failure = self._trigger_rate(failures, thresholds)
-        self.last_youden_j = self.last_trigger_rate_failure - self.last_trigger_rate_success
-
-    @staticmethod
-    def _trigger(record: VixCalibrationRecord, thresholds: VixThresholds) -> bool:
-        '''
-        1. Entropy rebounds upward from a local low (i.e. confidence -> uncertainty)
-        2. Entropy is locally volatile and trending upward
-        '''
-        return (
-            record.drawup_max > thresholds.tau_drawup
-            or (
-                record.vix_max > thresholds.tau_vix
-                and record.drift_max > thresholds.tau_drift
-            )
-        )
-
-    def _trigger_rate(self, records: list[VixCalibrationRecord], thresholds: VixThresholds) -> float:
-        return _rate([self._trigger(record, thresholds) for record in records])
-
-    def metrics(self) -> dict[str, float]:
-        successes = list(self.success_records)
-        failures = list(self.failure_records)
-        metrics = {
-            "entropy/calibration_ready": float(self.ready),
-            "entropy/calibration_buffer_size": float(self._num_records),
-            "entropy/calibration_success_count": float(len(successes)),
-            "entropy/calibration_failure_count": float(len(failures)),
-            "entropy/calibration_updates": float(self.update_count),
-            "entropy/calibration_trigger_rate_success": self.last_trigger_rate_success,
-            "entropy/calibration_trigger_rate_failure": self.last_trigger_rate_failure,
-            "entropy/calibration_youden_j": self.last_youden_j,
-            "entropy/calibration_fit_separation": float(self.last_fit_method == "separation"),
-            "entropy/calibration_fit_success_quantile": float(self.last_fit_method == "success_quantile"),
-            "entropy/calibration_fit_skipped": float(self.last_fit_method == "skipped"),
-            "entropy/calibration_max_success_trigger_rate": self.max_success_trigger_rate,
-            "entropy/control_success_vix_max_mean": _safe_mean(r.vix_max for r in successes),
-            "entropy/control_failure_vix_max_mean": _safe_mean(r.vix_max for r in failures),
-            "entropy/control_success_drawup_max_mean": _safe_mean(r.drawup_max for r in successes),
-            "entropy/control_failure_drawup_max_mean": _safe_mean(r.drawup_max for r in failures),
-            "entropy/control_success_drift_max_mean": _safe_mean(r.drift_max for r in successes),
-            "entropy/control_failure_drift_max_mean": _safe_mean(r.drift_max for r in failures),
-        }
-        metrics["entropy/control_vix_gap"] = (
-            metrics["entropy/control_failure_vix_max_mean"] - metrics["entropy/control_success_vix_max_mean"]
-        )
-        metrics["entropy/control_drawup_gap"] = (
-            metrics["entropy/control_failure_drawup_max_mean"] - metrics["entropy/control_success_drawup_max_mean"]
-        )
-        metrics["entropy/control_drift_gap"] = (
-            metrics["entropy/control_failure_drift_max_mean"] - metrics["entropy/control_success_drift_max_mean"]
-        )
-        if self.thresholds is not None:
-            metrics.update(
-                {
-                    "entropy/threshold_vix": self.thresholds.tau_vix,
-                    "entropy/threshold_drift": self.thresholds.tau_drift,
-                    "entropy/threshold_drawup": self.thresholds.tau_drawup,
-                }
-            )
-        return metrics
 
 
 class EntropyUpdateTracker:
     def __init__(
         self,
-        bootstrap_records: int,
         max_records: int,
-        update_interval: int = 64,
-        calibration_ema: float = 0.9,
         max_success_trigger_rate: float = 0.05,
         threshold_chunk_size: int = 64,
         classifier_update_interval: int = 64,
@@ -421,11 +83,16 @@ class EntropyUpdateTracker:
         self.failure_classifier_records: deque[EntropyClassifierRecord] = deque(maxlen=max_records)
         self.update_executor = ThreadPoolExecutor(max_workers=1)
         self._metrics_lock = Lock()
-        self.latest_metrics: dict[str, float] = {}
+        self.latest_classifier_metrics: dict[str, float] = {}
         self.update_jobs_submitted = 0
         self.update_jobs_completed = 0
         self.last_update_error: str | None = None
+        self._cumulative_treatment_successes = 0
+        self._cumulative_treatment_total = 0
+        self._cumulative_control_successes = 0
+        self._cumulative_control_total = 0
         self.classifier_manager = EntropyClassifierManager(
+            chunk_size=threshold_chunk_size,
             update_interval=classifier_update_interval,
             min_success_records=classifier_min_success_records,
             min_failure_records=classifier_min_failure_records,
@@ -438,13 +105,6 @@ class EntropyUpdateTracker:
             frontier_caps=classifier_frontier_caps,
             update_url=classifier_update_url,
             update_timeout_s=classifier_update_timeout_s,
-        )
-        self.calibrator = VixThresholdCalibrator(
-            max_records=max_records,
-            bootstrap_records=bootstrap_records,
-            update_interval=update_interval,
-            calibration_ema=calibration_ema,
-            max_success_trigger_rate=max_success_trigger_rate,
         )
 
     def request_xargs(self, sample_idx: int) -> dict[str, Any]:
@@ -551,6 +211,8 @@ class EntropyUpdateTracker:
         completion_lengths: list[int],
         entropy_metadata: list[dict[str, Any]],
     ) -> dict[str, float]:
+        group_metrics = self._group_metrics(rewards, completion_lengths, entropy_metadata)
+
         rewards_snapshot = [float(reward) for reward in rewards]
         completion_lengths_snapshot = [int(length) for length in completion_lengths]
         entropy_metadata_snapshot = deepcopy(entropy_metadata)
@@ -564,12 +226,11 @@ class EntropyUpdateTracker:
             entropy_metadata_snapshot,
         )
         future.add_done_callback(self._on_scored_group_processed)
-        return self._latest_metrics_snapshot()
 
-    def _latest_metrics_snapshot(self) -> dict[str, float]:
         with self._metrics_lock:
             pending = self.update_jobs_submitted - self.update_jobs_completed
-            metrics = dict(self.latest_metrics)
+            metrics = dict(self.latest_classifier_metrics)
+            metrics.update(group_metrics)
             metrics.update(
                 {
                     "entropy/update_background_pending": float(pending),
@@ -578,9 +239,9 @@ class EntropyUpdateTracker:
             )
             return metrics
 
-    def _on_scored_group_processed(self, future: Future[dict[str, float]]) -> None:
+    def _on_scored_group_processed(self, future: Future[None]) -> None:
         try:
-            metrics = future.result()
+            future.result()
         except Exception as error:
             logger.exception("Entropy scored-group background update failed")
             with self._metrics_lock:
@@ -589,7 +250,6 @@ class EntropyUpdateTracker:
             return
 
         with self._metrics_lock:
-            self.latest_metrics = metrics
             self.last_update_error = None
             self.update_jobs_completed += 1
 
@@ -598,17 +258,13 @@ class EntropyUpdateTracker:
         rewards: list[float],
         completion_lengths: list[int],
         entropy_metadata: list[dict[str, Any]],
-    ) -> dict[str, float]:
+    ) -> None:
         self.classifier_manager.maybe_install_completed()
 
         records_added = 0
         for reward, completion_len, metadata in zip(rewards, completion_lengths, entropy_metadata, strict=True):
             if metadata.get(REQUESTED_INTERVENE_KEY, False):
                 continue
-            record = self._record_from_metadata(float(reward), completion_len, metadata)
-            if record is None:
-                continue
-            self.calibrator.add_completion(record)
             classifier_record = self._classifier_record_from_metadata(
                 float(reward),
                 completion_len,
@@ -618,7 +274,6 @@ class EntropyUpdateTracker:
                 self._add_classifier_record(classifier_record)
             records_added += 1
         if records_added:
-            self.calibrator.maybe_update()
             self.classifier_manager.maybe_enqueue_training(
                 success_records=list(self.success_classifier_records),
                 failure_records=list(self.failure_classifier_records),
@@ -626,15 +281,11 @@ class EntropyUpdateTracker:
 
         self.classifier_manager.maybe_install_completed()
 
-        metrics = self.calibrator.metrics()
-        metrics.update(
-            self.classifier_manager.metrics(
+        with self._metrics_lock:
+            self.latest_classifier_metrics = self.classifier_manager.metrics(
                 success_records=list(self.success_classifier_records),
                 failure_records=list(self.failure_classifier_records),
             )
-        )
-        metrics.update(self._group_metrics(rewards, completion_lengths, entropy_metadata))
-        return metrics
 
     def _add_classifier_record(self, record: EntropyClassifierRecord) -> None:
         if record.success:
@@ -662,23 +313,6 @@ class EntropyUpdateTracker:
             reward=reward,
             completion_len=completion_len,
             features=features,
-        )
-
-    @staticmethod
-    def _record_from_metadata(
-        reward: float,
-        completion_len: int,
-        metadata: dict[str, Any],
-    ) -> VixCalibrationRecord | None:
-        windows = metadata.get(VIX_METADATA_KEY) or []
-        if not windows:
-            return None
-        return VixCalibrationRecord(
-            reward=reward,
-            completion_len=completion_len,
-            vix_max=max(float(w.get(VIX_VALUE_KEY, 0.0)) for w in windows),
-            drift_max=max(float(w.get(DRIFT_VALUE_KEY, 0.0)) for w in windows),
-            drawup_max=max(float(w.get(DRAWUP_VALUE_KEY, 0.0)) for w in windows),
         )
 
     def _group_metrics(
@@ -747,6 +381,27 @@ class EntropyUpdateTracker:
         metrics["entropy/treatment_minus_control_success_rate"] = (
             metrics["entropy/treatment_success_rate"] - metrics["entropy/control_success_rate"]
         )
+
+        if treatment_indices:
+            treatment_successes = sum(1 for i in treatment_indices if float(rewards[i]) > 0)
+            control_successes = sum(1 for i in control_indices if float(rewards[i]) > 0)
+            self._cumulative_treatment_successes += treatment_successes
+            self._cumulative_treatment_total += len(treatment_indices)
+            self._cumulative_control_successes += control_successes
+            self._cumulative_control_total += len(control_indices)
+        cum_treatment_rate = (
+            self._cumulative_treatment_successes / self._cumulative_treatment_total
+            if self._cumulative_treatment_total else 0.0
+        )
+        cum_control_rate = (
+            self._cumulative_control_successes / self._cumulative_control_total
+            if self._cumulative_control_total else 0.0
+        )
+        metrics["entropy/cumulative_treatment_success_rate"] = cum_treatment_rate
+        metrics["entropy/cumulative_control_success_rate"] = cum_control_rate
+        metrics["entropy/cumulative_treatment_minus_control"] = cum_treatment_rate - cum_control_rate
+        metrics["entropy/cumulative_treatment_total"] = float(self._cumulative_treatment_total)
+        metrics["entropy/cumulative_control_total"] = float(self._cumulative_control_total)
 
         metrics.update(self._vix_group_metrics("control", control_indices, entropy_metadata))
         metrics.update(self._vix_group_metrics("treatment", treatment_indices, entropy_metadata))
